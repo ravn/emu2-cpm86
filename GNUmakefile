@@ -37,7 +37,7 @@ obj:
 .PHONY: check test
 check test: emu2 tests/cpm86-reloc/run.sh tests/test_asm86_no_truncate.sh
 	env EMU2="$$(pwd -P)"/emu2 sh tests/cpm86-reloc/run.sh
-	env root="$(CURDIR)" EMU2="$$(pwd -P)"/emu2 sh tests/test_asm86_no_truncate.sh
+	env root="/Users/ravn/z80/cpm86-crossdev" EMU2="$$(pwd -P)"/emu2 sh tests/test_asm86_no_truncate.sh
 
 .PHONY: clean distclean
 clean distclean:
