@@ -889,17 +889,15 @@ static unsigned bdos_read(unsigned ah)
     return (r == 3) ? 0 : r;
 }
 
-// CP/M sequential read/write (BDOS 20/21).  Byte 0x0D of the FCB is S1, which
-// CP/M reserves and the application must not rely on -- but emu2's DOS layer
-// derives the sequential block number from the 16-bit field at 0x0C (EX | S1<<8).
-// Some CP/M programs (e.g. VEDIT PLUS) inadvertently leave a stale value in S1
-// which would make the block number huge and seek past EOF so the first read
-// returns no data and the program treats the file as empty.  Clear S1 before
-// delegating so only EX (byte 0x0C) drives the file position.  (The LRBC now
-// lives at FCB+32 / 0x20, not in S1, so this clear does not discard LRBC data.)
+// CP/M sequential read/write (BDOS 20/21).  FCB byte 0x0D = S1, which some
+// programs (e.g. VEDIT PLUS) leave with a stale non-zero value from a prior
+// FCB use.  Emu2's DOS layer folds S1 into the block number as the high byte
+// of the 16-bit field at FCB+0x0C, so a stale S1 makes the first sequential
+// read seek past EOF.  The stale-S1 clear is now done at open time (BDOS 15)
+// where it is safe; see case 15.  Do NOT clear S1 here because programs like
+// RASM-86 1.2 update S1 themselves as they advance through large files.
 static unsigned bdos_seq(unsigned ah)
 {
-    memory[cpuGetAddrDS(cpuGetDX()) + 0x0D] = 0;
     return (ah == 0x14) ? bdos_read(ah) : bdos_via_dos(ah);
 }
 
@@ -1441,13 +1439,27 @@ void intr_cpm_bdos(void)
             bdos_ret(0x00);
         }
         break; 
-    case 16: // close file.  Per CP/M 3 / DOS Plus, the LRBC (last-record byte
-             // count) is set AFTER close via BDOS 30 (F_ATTRIB) with bit 7 of
-             // FCB+6 set - handled in case 30 below.  FCB+0x20 at close time is
-             // the CR (current record) field from sequential I/O, NOT an LRBC
-             // value, so we must not interpret it as one.
+    case 16: // close file.  CP/M 3 LRBC: if the program stored a partial last-
+    {        // record byte count at FCB+32 (FCB+0x20), trim the host file to
+             // that exact length before closing so its on-disk size is no longer
+             // record-rounded.  Programs like RASM-86 1.2 set the LRBC directly
+             // at FCB+0x20 and rely on close (BDOS 16) to truncate; they do NOT
+             // use the BDOS 30 (F_ATTRIB) route introduced in later DOS Plus.
+        if(cpm_lrbc_trunc)
+        {
+            uint32_t fcb = cpuGetAddrDS(dx);
+            unsigned lrbc = memory[fcb + 0x20] & 0x7F; // FCB+32; 0 = full record
+            unsigned long sz = get32(fcb + 0x10);
+            if(lrbc && sz)
+            {
+                unsigned long exact = cpm_lrbc_exact(sz, lrbc);
+                if(exact < sz)
+                    dos_truncate_fcb(fcb, exact);
+            }
+        }
         bdos_ret(bdos_via_dos(0x10));
         break;
+    }
     case 17: bdos_ret(cpm_search(0x11)); break; // search for first (CP/M dir entry)
     case 18: bdos_ret(cpm_search(0x12)); break; // search for next
     case 19: bdos_ret(bdos_via_dos(0x13)); break; // delete file
@@ -1601,6 +1613,13 @@ void intr_cpm_bdos(void)
     case 15: // open file (+ CP/M-3 LRBC byte count at FCB+32)
     {
         uint32_t fcb = cpuGetAddrDS(dx);
+        // Clear stale S1 (FCB+0x0D) before opening.  Some programs (e.g.
+        // VEDIT PLUS) reuse an FCB without zeroing S1, which makes emu2 seek
+        // past EOF on the very first sequential read.  Clearing here is safe:
+        // S1 must be 0 at the start of a new open per CP/M convention.
+        // Do NOT clear S1 inside bdos_seq (BDOS 20/21) because programs like
+        // RASM-86 1.2 update S1 themselves as they advance through large files.
+        memory[fcb + 0x0D] = 0;
         // Snapshot FCB+32 BEFORE calling the DOS open handler: dos.c zeroes
         // FCB+32 (the "current record" field) during open, so we must capture
         // the caller's 0xFF signal before it is overwritten.
