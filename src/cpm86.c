@@ -1439,27 +1439,14 @@ void intr_cpm_bdos(void)
             bdos_ret(0x00);
         }
         break; 
-    case 16: // close file.  CP/M 3 LRBC: if the program stored a partial last-
-    {        // record byte count at FCB+32 (FCB+0x20), trim the host file to
-             // that exact length before closing so its on-disk size is no longer
-             // record-rounded.  Programs like RASM-86 1.2 set the LRBC directly
-             // at FCB+0x20 and rely on close (BDOS 16) to truncate; they do NOT
-             // use the BDOS 30 (F_ATTRIB) route introduced in later DOS Plus.
-        if(cpm_lrbc_trunc)
-        {
-            uint32_t fcb = cpuGetAddrDS(dx);
-            unsigned lrbc = memory[fcb + 0x20] & 0x7F; // FCB+32; 0 = full record
-            unsigned long sz = get32(fcb + 0x10);
-            if(lrbc && sz)
-            {
-                unsigned long exact = cpm_lrbc_exact(sz, lrbc);
-                if(exact < sz)
-                    dos_truncate_fcb(fcb, exact);
-            }
-        }
+    case 16: // close file.
+        // NOTE: do NOT apply LRBC truncation here.  FCB+0x20 at close time
+        // holds CR (current record from dos_rw_record_fcb), NOT an LRBC byte
+        // count.  Misreading it as LRBC truncates correct output files.
+        // The double-close support (case 16 with already-closed handle) is
+        // handled by the upstream fix in 0dee276; see issue ravn/emu2-cpm86#19.
         bdos_ret(bdos_via_dos(0x10));
         break;
-    }
     case 17: bdos_ret(cpm_search(0x11)); break; // search for first (CP/M dir entry)
     case 18: bdos_ret(cpm_search(0x12)); break; // search for next
     case 19: bdos_ret(bdos_via_dos(0x13)); break; // delete file
