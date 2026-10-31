@@ -1,4 +1,3 @@
-
 #define _GNU_SOURCE
 
 #include "cpm86.h"
@@ -6,6 +5,7 @@
 #include "dos.h"
 #include "dosnames.h"
 #include "emu.h"
+#include "env.h"
 #include "keyb.h"
 #include "timer.h"
 #include "video.h"
@@ -21,6 +21,8 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+int opt_fullscreen = 0;
 
 uint8_t read_port(unsigned port)
 {
@@ -137,6 +139,13 @@ void bios_routine(unsigned inum)
         print_error("error, unimplemented opcode %02X at cs:ip = %04X:%04X\n",
                     memory[cpuGetAddress(cs, ip)], cs, ip);
     }
+    else if(inum == 0x00)
+    {
+        uint16_t ip = cpuGetStack(0);
+        uint16_t cs = cpuGetStack(2);
+        print_error("error, divide overflow at cs:ip = %04X:%04X\n",
+                    cs, ip);
+    }
     else if(inum == 0x28)
     {
         if(cpm86_active)
@@ -205,6 +214,28 @@ NORETURN static void exit_handler(int x)
 
 static void init_bios_mem(void)
 {
+    // Reset INT 0 Vector
+    put16(0x0, 0x0000);       // IP = 0000
+    put16(0x2, 0x0000);       // CS = 0000
+    // Hardware IRQ vectors (IRQ 0..7 -> INT 8..15):
+    // Point INT 8 (Timer) and INT 9 (Keyboard) to CS=0000, IP=inum so hardware
+    // IRQs enter emu2's BIOS dispatch in next_instruction().
+    for(int i = 8; i <= 15; i++)
+    {
+        put16(i * 4, i);      // IP = inum
+        put16(i * 4 + 2, 0);  // CS = 0000
+    }
+
+    // Keyboard buffer pointers in BDA (0040:001A..003E)
+    memory[0x41A] = 0x1E; // buffer head offset
+    memory[0x41B] = 0x00;
+    memory[0x41C] = 0x1E; // buffer tail offset
+    memory[0x41D] = 0x00;
+    memory[0x480] = 0x1E; // buffer start offset
+    memory[0x481] = 0x00;
+    memory[0x482] = 0x3E; // buffer end offset
+    memory[0x483] = 0x00;
+
     // Some of those are also in video.c, we write a
     // default value here for programs that don't call
     // INT10 functions before reading.
@@ -242,10 +273,17 @@ static void dump_ram_on_exit(void)
 int main(int argc, char **argv)
 {
     int i;
+    int arg_script_delay = -1;
+    int arg_script_initial_delay = -1;
+    int arg_script_newline_delay = -1;
     prog_name = argv[0];
+
+    if(getenv(ENV_FULLSCREEN))
+        opt_fullscreen = atoi(getenv(ENV_FULLSCREEN));
 
     // Process command line options
     int bin_load_seg = 0, bin_load_ip = 0, bin_load_addr = -1;
+    int opt_cpu_level = 0;
     int skip_init_bios = 0;
     for(i = 1; i < argc; i++)
     {
@@ -260,10 +298,15 @@ int main(int argc, char **argv)
         switch(flag)
         {
         case 'b':
+        case 'c':
         case 'r':
         case 'm':
         case 'P':
         case 'X':
+        case 's':
+        case 'i':
+        case 'd':
+        case 'l':
             if(argv[i][2])
                 opt = argv[i] + 2;
             else
@@ -282,6 +325,16 @@ int main(int argc, char **argv)
         case 'v':
             print_version();
             exit(EXIT_SUCCESS);
+        case 'f':
+            opt_fullscreen = 1;
+            break;
+        case 'c':
+            opt_cpu_level = cpuParseLevel(opt);
+            if(!opt_cpu_level)
+                print_usage_error("invalid CPU type '%s' "
+                                  "(use 8088/8086, 80186, or 80286).",
+                                  opt);
+            break;
         case 'b':
             bin_load_addr = strtol(opt, &ep, 0);
             if(*ep || bin_load_addr < 0 || bin_load_addr > 0xFFFF0)
@@ -305,6 +358,56 @@ int main(int argc, char **argv)
                     print_usage_error("binary run address '%s' invalid.", opt);
             }
             break;
+        case 's':
+            {
+                if (arg_script_initial_delay >= 0)
+                    keyb_set_script_initial_delay(arg_script_initial_delay);
+
+                int delay = (arg_script_delay >= 0) ? arg_script_delay : 1;
+
+                if (arg_script_newline_delay >= 0)
+                    keyb_set_script_newline_delay(arg_script_newline_delay);
+
+                keyb_load_script(opt, delay);
+            }
+        break;
+        case 'i':
+            {
+                char *ep;
+                long ms = strtol(opt, &ep, 10);
+
+                if (*ep != 0 || ms < 0 || ms > 1000000)
+                    print_usage_error("initial delay '%s' invalid.", opt);
+
+                arg_script_initial_delay = (int)ms;
+            }
+        break;
+        case 'd':
+            {
+                char *ep;
+                long ms = strtol(opt, &ep, 10);
+
+                if (*ep != 0 || ms < 0 || ms > 1000000)
+                    print_usage_error("keystroke delay '%s' invalid.", opt);
+
+                arg_script_delay = (int)ms;
+            }
+        break;
+        case 'l':
+            {
+                char *ep;
+                long ms = strtol(opt, &ep, 10);
+
+                if (*ep != 0 || ms < 0 || ms > 1000000)
+                    print_usage_error("newline delay '%s' invalid.", opt);
+
+                if(arg_script_delay >= 0 && ms < arg_script_delay)
+                    print_usage_error("newline delay '%ld' must be >= keystroke delay '%d'.",
+                                      ms, arg_script_delay);
+
+                arg_script_newline_delay = (int)ms;
+            }
+        break;
         case 'm':
         {
             long v = strtol(opt, &ep, 0);
@@ -356,6 +459,19 @@ int main(int argc, char **argv)
     // Init debug facilities
     init_debug(argv[1]);
     init_cpu();
+
+    /* -c overrides EMU2_CPU, including an invalid environment setting. */
+    if(!opt_cpu_level && getenv(ENV_CPU))
+    {
+        const char *name = getenv(ENV_CPU);
+        opt_cpu_level = cpuParseLevel(name);
+        if(!opt_cpu_level)
+            print_error("invalid CPU type '%s' "
+                        "(use 8088/8086, 80186, or 80286)\n",
+                        name);
+    }
+    if(opt_cpu_level)
+        cpuSetLevel(opt_cpu_level);
 
     if(getenv("EMU2_RAMDUMP"))
         atexit(dump_ram_on_exit);

@@ -1,12 +1,12 @@
-#ifndef EMU_H
-#define EMU_H
-
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
+#if !defined(INCLUDE_EMU_H)
+# define INCLUDE_EMU_H
+# include <stdint.h>
+# include <stdio.h>
+# include <string.h>
 
 extern volatile int exit_cpu;
 extern uint8_t memory[];
+extern int opt_fullscreen;
 
 int cpuGetAddress(uint16_t segment, uint16_t offset);
 int cpuGetAddrDS(uint16_t offset);
@@ -22,6 +22,8 @@ void bios_routine(unsigned inum);
 // CPU interface
 void execute(void); // 1 ins.
 void init_cpu(void);
+int cpuParseLevel(const char *name);
+void cpuSetLevel(int level);
 
 // async HW update
 void emulator_update(void);
@@ -160,5 +162,4 @@ static inline char *getstr(uint32_t addr, unsigned size)
         memcpy(buf[cbuf], memory + addr, size);
     return buf[cbuf];
 }
-
-#endif // EMU_H
+#endif

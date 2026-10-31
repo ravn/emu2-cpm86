@@ -1,4 +1,3 @@
-
 #include "timer.h"
 #include "dbg.h"
 #include "emu.h"
@@ -38,8 +37,15 @@ void update_timer(void)
     }
 
     long cnt = time_to_bios(tv) - start_timer;
-    bios_timer = cnt % 0x1800B0;
-    bios_dater = (cnt / 0x1800B0) & 0xFF;
+    long day_ticks = cnt % 0x1800B0;
+    long days = cnt / 0x1800B0;
+    if(day_ticks < 0)
+    {
+        day_ticks += 0x1800B0;
+        days -= 1;
+    }
+    bios_timer = (uint32_t)day_ticks;
+    bios_dater = (uint16_t)(days & 0xFF);
     put32(0x46C, bios_timer);
     memory[0x470] = bios_dater;
 }
@@ -49,7 +55,7 @@ static void set_timer(unsigned x)
 {
     struct timeval tv;
     gettimeofday(&tv, 0);
-    start_timer = time_to_bios(tv) + x;
+    start_timer = time_to_bios(tv) - x;
     update_timer();
 }
 
@@ -73,18 +79,22 @@ static struct i8253_timer
 #define TIMER_WORD_L 2
 #define TIMER_WORD_M 3
 
-// Returns port timer at 1193179.97HZ
+// Returns port timer at 1193179.97HZ.  The PIT is hardware time, not
+// civil time, so use a monotonic clock which cannot jump when the host
+// wall clock is adjusted.
 static long get_timer_clock(void)
 {
-    struct timeval tv;
-    gettimeofday(&tv, 0);
-    // us in microseconds
-    // (don't use full seconds resolution, to avoid losing precision
-    double us = (tv.tv_sec & 0xFFFFFF) * 1000000.0 + tv.tv_usec;
-    // Convert to "counts"
-    us = us * (105.0 / 88.0);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    // Convert the monotonic clock to PIT counts.  Keep the seconds and
+    // nanoseconds terms separate so the higher-resolution clock does not
+    // lose precision by first combining them into one large value.
+    double counts = (double)(ts.tv_sec & 0xFFFFFF) * (105000000.0 / 88.0);
+    counts += (double)ts.tv_nsec * (105.0 / 88000.0);
+
     // And return as long (64 bits)
-    return lrint(us);
+    return lrint(counts);
 }
 
 // Get actual value in timer
@@ -266,10 +276,21 @@ void intr1A(void)
     }
     case 1: // SET SYSTEM TIME
     {
+#ifndef LITERAL_SET_TIME_READING
+# define LITERAL_SET_TIME_READING 1
+#endif
+#if LITERAL_SET_TIME_READING
         unsigned t = cpuGetDX() + (cpuGetCX() << 16);
+#else
+	unsigned t = 0;
+#endif
         set_timer(t);
+#if LITERAL_SET_TIME_READING
         debug(debug_int, "SET TIME: %02x:%04x:%04x\n", cpuGetAX(), cpuGetCX(),
               cpuGetDX());
+#else
+        debug(debug_int, "SET TIME: 0\n");
+#endif
         break;
     }
     case 2: // GET RTC TIME

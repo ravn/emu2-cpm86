@@ -10,67 +10,195 @@
 
 char *prog_name;
 
+#define TRIM_BUFSIZE 256
+#define TRIM_RING 3 /* max reentrancy depth, use calls + 1 */
+
+static char *
+sqz_str(const char * const s)
+{
+    static char bufs [TRIM_RING] [TRIM_BUFSIZE];
+    static int idx = 0;
+
+    const char *p;
+    const char *q;
+    const char *last;
+
+    char *buf;
+    char *d;
+
+    buf = bufs[idx];
+    idx++;
+
+    if (idx >= TRIM_RING)
+        idx = 0;
+
+    if (s == 0) {
+        buf [0] = '\0';
+
+        return buf;
+    }
+
+    p = s;
+
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        p++;
+
+    if (*p == '\0') {
+        buf[0] = '\0';
+
+        return buf;
+    }
+
+    q = p;
+    last = p;
+
+    while (*q != '\0') {
+        if (*q != ' ' && *q != '\t' && *q != '\r' && *q != '\n')
+            last = q;
+
+        q++;
+    }
+
+    d = buf;
+
+    {
+        int in_ws = 0;
+
+        while (p <= last && d < buf + (TRIM_BUFSIZE - 1)) {
+
+            if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+                in_ws = 1;
+            } else {
+                if (in_ws) {
+                    *d++ = ' ';
+                    in_ws = 0;
+                }
+
+                *d++ = *p;
+            }
+
+            p++;
+        }
+    }
+
+    *d = '\0';
+
+    return buf;
+}
+
 void print_version(void)
 {
-    printf("EMU2 - Simple x86 + DOS and CP/M-86 Emulator, version " EMU2_VERSION
-#ifdef __DATE__
-           "  (Compiled " __DATE__ ")"
+    printf("emu2: x86, DOS, and CP/M-86 emulator, v" EMU2_VERSION
+#if defined (__DATE__) && defined (__TIME__)
+           " (built %s %s)", sqz_str(__DATE__), sqz_str(__TIME__)
+#elif defined (__DATE__)
+           " (built %s)", sqz_str(__DATE__)
 #endif
-           "\n");
+          );
+    printf("\n");
 }
 
 NORETURN void print_usage(void)
 {
     print_version();
-    printf("\n"
-           "Usage: %s [options] <prog.exe> [args...] [-- environment vars]\n"
-           "\n"
-           "Options (processed before program name):\n"
-           "  -h            Show this help.\n"
-           "  -b <addr>     Load header-less binary at address.\n"
-           "  -r <seg>:<ip> Specify a run address to start execution.\n"
-           "                (only for binary loaded data).\n"
-           "  -m <kb>       CP/M-86 TPA size in KB; same as CPM86_TPA_KB env var.\n"
-           "                Default: ~640K (standard DOS arena).\n"
-           "  -P <byte>     Fill free CP/M-86 memory with <byte> before loading\n"
-           "                (same as CPM86_POISON=<byte>); implies -D.\n"
-           "  -D            Fill free CP/M-86 memory with 0xFF before loading\n"
-           "                (same as CPM86_DIRTY_GROUPS).\n"
-           "\n"
-           "Environment variables:\n"
-           "  %-18s  Base name of a file to write the debug log, defaults to\n"
-           "\t\t      the exe name if not given.\n"
-           "  %-18s  List of debug options to activate, from the following:\n"
-           "\t\t      'cpu', 'int', 'port', 'dos', 'video'.\n"
-           "  %-18s  DOS program name, if not given use the unix name.\n"
-           "  %-18s  DOS default (current) drive letter, if not given use 'C:'\n"
-           "  %-18s  DOS current working directory, use 'C:\\' if not given.\n"
-           "  %-18s  Set unix path as root of drive 'n', by default all drives\n"
-           "\t\t      point to the unix working directory.\n"
-           "  %-18s  Set DOS code-page. Set to '?' to show list of code-pages.\n"
-           "  %-18s  Limit DOS memory to 512KB, fixes some old buggy programs.\n"
-           "  %-18s  Specifies a DOS append paths, separated by ';'.\n"
-           "  %-18s  Set version of DOS to emulate, e.g. '2.11', '3.20', etc.\n"
-           "  %-18s  Setup text mode with given number of rows, from 12 to 50.\n"
-           "  %-18s  CP/M-86 disk block size: auto|1k|2k|4k|8k|16k (per drive\n"
-           "\t\t      with EMU2_CPM_DISK_<letter>).\n"
-           "  %-18s  CP/M-86 auto-disk target free-space percent (default 25).\n"
-           "  %-18s  CP/M-86 CP/M-3 limits: 2048 extents / 32MB files / 512MB.\n"
-           "  %-18s  CP/M-86 reported version, e.g. '3.1' (default) or '2.2'.\n"
-           "\t\t      3.0+ enables the last-record byte count for exact sizes.\n"
-           "  %-18s  Keep CP/M-86 output padded to 128-byte records: report the\n"
-           "\t\t      LRBC byte count but do not trim host files to it.\n"
-           "  %-18s  Use the ISX last-record byte count convention (unused bytes)\n"
-           "\t\t      instead of DOS Plus (used bytes); default off (DOS Plus).\n"
-           "  %-18s  CP/M-86 console emulation (VT52/colour); set 0 to disable.\n"
-           "  %-18s  CP/M-86 TPA size in KB; same as -m.\n"
-           "  %-18s  Fill free memory with <byte> before load (debug).\n"
-           "  %-18s  Fill free memory with 0xFF before load (debug).\n",
-           prog_name, ENV_DBG_NAME, ENV_DBG_OPT, ENV_PROGNAME, ENV_DEF_DRIVE, ENV_CWD,
-           ENV_DRIVE "n", ENV_CODEPAGE, ENV_LOWMEM, ENV_APPEND, ENV_DOSVER, ENV_ROWS,
-           "EMU2_CPM_DISK", "EMU2_CPM_FREE", "EMU2_CPM_PLUS", ENV_CPMVER,
-           ENV_LRBC_NOTRUNC, ENV_CPM_ISXLRBC, "EMU2_VT52",
-           "CPM86_TPA_KB", "CPM86_POISON", "CPM86_DIRTY_GROUPS");
+    printf(
+"\n"
+"Usage: %s [options] <prog.exe> [args...] [-- environment vars]\n"
+"\n"
+"Options (processed before program name):\n"
+"  -h            Show this help.\n"
+"  -f            Start explicitly as a full-screen direct video program;\n"
+"                turns off some text processing heuristics.\n"
+"                (Same as EMU2_FULLSCREEN environment variable.)\n"
+"  -b <addr>     Load header-less binary at address.\n"
+"  -r <seg:ip>   Specify a run address to start execution.\n"
+"                (Only used for binary loaded data.)\n"
+"  -m <kb>       CP/M-86 TPA in KB (default: 640K).\n"
+"                (Same as EMU2_CPM_TPA environment variable.)\n"
+"  -c <cpu>      CPU model: 8088, 8086, 80186, or 80286 (default: 80286).\n"
+"                (Same as EMU2_CPU environment variable.)\n"
+"  -s <file>     Specify a keyboard script file (injecting keystrokes).\n"
+"  -d <ms>       Delay <ms> between each keyboard script character.\n"
+"                (Default is 1ms; use '0' to send as fast as possible.)\n"
+"  -i <ms>       Delay <ms> before sending keyboard script characters.\n"
+"  -l <ms>       Delay keyboard script by <ms> after each newline.\n"
+"  -P <byte>     Fill CP/M-86 memory with <byte> before loading.\n"
+"                (Same as EMU2_CPM_POISON=<byte> environment variable.)\n"
+"  -D            Fill CP/M-86 memory with 0xFF before loading.\n"
+"                (Same as EMU2_CPM_DIRTY environment variable.)\n"
+"\n"
+"Environment variables:\n"
+             "  %-18s  Base name of a file to write the debug log, defaults to\n"
+"                      the exe name if not given.\n"
+             "  %-18s  List of debug options to activate, from the following:\n"
+"                      'cpu', 'int', 'port', 'dos', 'video'.\n"
+             "  %-18s  DOS program name, if not given use the UNIX name.\n"
+             "  %-18s  DOS default (current) drive letter, if not given use 'C:'\n"
+             "  %-18s  DOS current working directory, use 'C:\\' if not given.\n"
+             "  %-18s  Set UNIX path as root of drive 'n', by default all drives\n"
+"                      point to the UNIX working directory.\n"
+             "  %-18s  Sets the codepage. Set to '?' to show list of codepages,\n"
+"                      or '0' to explictly disable translation (default: CP437).\n"
+             "  %-18s  Limit DOS memory to 512KB, fixes some old buggy programs.\n"
+             "  %-18s  Specifies DOS APPEND paths, separated by ';'.\n"
+             "  %-18s  Set version of DOS to emulate, e.g. '2.11', '3.20', etc.\n"
+             "  %-18s  Setup text mode with given number of rows (12 to 50);\n"
+"                      Use 'auto' for automatic detection (clamped 12 to 50).\n"
+             "  %-18s  Setup text mode with given number of columns (40 to 132);\n"
+"                      Use 'auto' for automatic detection (clamped 40 to 132).\n"
+             "  %-18s  Start explicitly as a full-screen direct video program.\n"
+"                      Turns off some text processing heuristics; same as '-f'.\n"
+             "  %-18s  Specifies CP/M-86 APPEND drive letters, separated by ';'.\n"
+             "  %-18s  CP/M-86 disk block size: auto|1k|2k|4k|8k|16k (per drive\n"
+"                      with EMU2_CPM_DISK_<letter>).\n"
+             "  %-18s  CP/M-86 auto-disk target free-space percent (default 25).\n"
+             "  %-18s  CP/M-86 CP/M-3 limits: 2048 extents / 32MB files / 512MB.\n"
+             "  %-18s  CP/M-86 reported version, e.g. '3.1' (default) or '2.2'.\n"
+"                      3.0+ enables the last-record byte count for exact sizes.\n"
+             "  %-18s  Keep CP/M-86 output padded to 128-byte record: report the\n"
+"                      LRBC byte count but do not trim host files to it.\n"
+             "  %-18s  Use ISX last-record byte count convention (unused bytes)\n"
+"                      instead of DOS-Plus (used bytes); default off (DOS-Plus).\n"
+             "  %-18s  CP/M-86 console emulation (VT102+DRI); set 0 to disable.\n"
+             "  %-18s  CP/M-86 TPA size in KB; same as '-m'.\n"
+             "  %-18s  Fill memory with <byte> before loading (for debugging).\n"
+             "  %-18s  Fill memory with 0xFF before loading (for debugging).\n"
+             "  %-18s  Count of kbhit calls over EMU2_KBHIT_TIME duration before\n"
+"                      throttling (default 1000, 0 disables throttling).\n"
+             "  %-18s  Time (in microseconds) for kbhit throttling detection\n"
+"                      (default 10000).\n"
+             "  %-18s  Sleep time (in microseconds) for the kbhit throttle delay\n"
+"                      (default 10000).\n"
+             "  %-18s  CPU model: 8088, 8086, 80186, or 80286 (default: 80286).\n",
+           prog_name,
+           ENV_DBG_NAME,
+           ENV_DBG_OPT,
+           ENV_PROGNAME,
+           ENV_DEF_DRIVE,
+           ENV_CWD,
+           ENV_DRIVE "n",
+           ENV_CODEPAGE,
+           ENV_LOWMEM,
+           ENV_APPEND,
+           ENV_DOSVER,
+           ENV_ROWS,
+           ENV_COLS,
+           ENV_FULLSCREEN,
+           ENV_CPM_APPEND,
+           "EMU2_CPM_DISK",
+           "EMU2_CPM_FREE",
+           "EMU2_CPM_PLUS",
+           ENV_CPMVER,
+           ENV_LRBC_NOTRUNC,
+           ENV_CPM_ISXLRBC,
+           "EMU2_CPM_VT52",
+           "EMU2_CPM_TPA",
+           "EMU2_CPM_POISON",
+           "EMU2_CPM_DIRTY",
+           EMU2_KBHIT_CALLS,
+           EMU2_KBHIT_TIME,
+           EMU2_KBHIT_SLEEP,
+           ENV_CPU);
     exit(EXIT_SUCCESS);
 }
 
@@ -159,3 +287,4 @@ void debug(enum debug_type dt, const char *format, ...)
         fflush(debug_files[dt]);
     }
 }
+// vim: set ts=8 sw=4 tw=0 expandtab cc=82 :

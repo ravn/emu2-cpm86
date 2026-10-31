@@ -33,6 +33,8 @@ static uint32_t nls_dbc_set_table;
 static uint8_t *nls_country_info;
 static uint32_t dos_sysvars;
 static uint32_t dos_append;
+static char cpm_append_buf[256];
+static char *cpm_append_env = NULL;
 
 // Last error - used to implement "get extended error"
 static uint8_t dos_error;
@@ -40,6 +42,8 @@ static uint8_t dos_error;
 // Returns "APPEND" path, if activated:
 static const char *append_path(void)
 {
+    if(cpm86_active)
+        return cpm_append_env;
     return (memory[dos_append] & 0x01) ? ((char *)memory + dos_append + 2) : 0;
 }
 
@@ -208,8 +212,21 @@ static int dos_open_file(int create, int access_mode, int name_addr)
     int mflag = 0;
     if(create)
     {
-        // Use exclusive access on create == 2, to fail on existing file
-        mflag = O_CREAT | O_RDWR | (create == 2 ? O_EXCL : 0);
+        // Use exclusive access on create == 2, to fail on existing file.
+        // O_TRUNC is required here: DOS "create" semantics (AH=3Ch, and
+        // AH=6Ch cmod=0x12 "create if not exists, clear and open if
+        // exists") clear an already-existing file to zero length before
+        // writing, matching the "w+b" mode string already used below for
+        // fdopen()'s own stdio-buffering wrapper -- but fdopen() only
+        // wraps an already-open fd, it does not itself reopen/truncate
+        // anything, so without O_TRUNC on the real open() call just
+        // below, an existing file's old content past whatever the new,
+        // possibly-shorter write covers was silently left on disk
+        // (confirmed: re-running a program that assign/rewrite/write/
+        // close's a shorter amount of new text over an existing longer
+        // file left the old file's own untouched byte length and stale
+        // trailing bytes past the new content, mid-token in one repro).
+        mflag = O_CREAT | O_RDWR | O_TRUNC | (create == 2 ? O_EXCL : 0);
         mode = "w+b";
     }
     else
@@ -454,7 +471,7 @@ int dos_truncate_fcb(int fcb_addr, unsigned long length)
 {
     unsigned h = get16(fcb_addr + 0x18);
     FILE *f = (h < max_handles) ? handles[h] : 0;
-    if(!f || !handle_written[h])
+    if(!f || handle_written[h])
         return -1;
     fflush(f);
     if(ftruncate(fileno(f), (off_t)length))
@@ -590,7 +607,7 @@ static int dos_rw_record_fcb(unsigned addr, int write, int update, int seq)
     }
 }
 
-// Converts Unix time_t to DOS time/date
+// Converts UNIX time_t to DOS time/date
 static uint32_t get_time_date(time_t tm)
 {
     struct tm lt;
@@ -604,7 +621,7 @@ static uint32_t get_time_date(time_t tm)
         return (1 << 16) | 1;
 }
 
-// Converts Unix mode to DOS attributes
+// Converts UNIX mode to DOS attributes
 static int get_attributes(mode_t md)
 {
     int r = 0;
@@ -762,7 +779,7 @@ static void dos_find_next(int first)
     {
         debug(debug_dos, "\t'%s' ('%s')\n", d->dosname, d->unixname);
 
-        // Fills the Find First Data from a dos/unix name pair
+        // Fills the Find First Data from a DOS/UNIX name pair
         if(strcmp("//", d->unixname))
         {
             // Normal file/directory
@@ -963,6 +980,31 @@ void dos_console_putc(uint8_t ch)
         putchar(ch);
 }
 
+// Writes a DOS-codepage byte to a host FILE*, translated to UTF-8. For the upper half
+// (0x80-0xFF) the codepage-specific chars, and bytes below 0x80 are written unchanged.
+static void putc_cp(uint8_t ch, FILE *f)
+{
+    if(ch < 0x80 || codepage_disabled())
+    {
+        putc(ch, f);
+        return;
+    }
+    uint16_t uc = get_unicode(ch);
+    if(uc < 128)
+        putc(uc, f);
+    else if(uc < 0x800)
+    {
+        putc(0xC0 | (uc >> 6), f);
+        putc(0x80 | (uc & 0x3F), f);
+    }
+    else
+    {
+        putc(0xE0 | (uc >> 12), f);
+        putc(0x80 | ((uc >> 6) & 0x3F), f);
+        putc(0x80 | (uc & 0x3F), f);
+    }
+}
+
 // Writes a character to standard output.
 static void dos_putchar(uint8_t ch, int fd)
 {
@@ -982,13 +1024,18 @@ static void dos_putchar(uint8_t ch, int fd)
         else
             video_putch(ch);
     }
+    else if(devinfo[fd] == 0x80D3)
+    {
+        FILE *out = handles[fd];
+        if(!fd && devinfo[0] == 0x80D3 && devinfo[1] == 0x80D3)
+            // DOS programs can write to STDIN and expect output to the terminal.
+	    // This hack will only work if STDOUT is not redirected, in real DOS
+	    // you can redirect STDOUT and write to STDIN.
+            out = handles[1];
+        putc_cp(ch, out ? out : stdout);
+    }
     else if(!handles[fd])
         putchar(ch);
-    else if(!fd && devinfo[0] == 0x80D3 && devinfo[1] == 0x80D3)
-        // DOS programs can write to STDIN and expect output to the terminal.
-        // This hack will only work if STDOUT is not redirected, in real DOS
-        // you can redirect STDOUT and write to STDIN.
-        fputc(ch, handles[1]);
     else
         fputc(ch, handles[fd]);
 }
@@ -1108,7 +1155,20 @@ static void char_input(int brk)
 // Returns true if a character to read is pending
 static int char_pending(void)
 {
-    return (inp_last_key != 0) || kbhit();
+    if(inp_last_key != 0)
+        return 1;
+    // When stdin is not a console (e.g. pipe/file), check the file descriptor
+    // directly rather than polling the keyboard via kbhit().
+    if(devinfo[0] != 0x80D3 && handles[0])
+    {
+        int fd = fileno(handles[0]);
+        struct timeval tv = {0, 0};
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        return select(fd + 1, &fds, NULL, NULL, &tv) > 0;
+    }
+    return kbhit();
 }
 
 static int line_input(FILE *f, uint8_t *buf, int max)
@@ -1351,6 +1411,148 @@ void intr2f(void)
     }
 }
 
+// Fills 'buf[0..n-1]' with random lowercase-alphanumeric characters for a
+// unique temp name.
+static void tmp_name_suffix(char *buf, int n)
+{
+    static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    static int seeded;
+    if(!seeded)
+    {
+        srand((unsigned)time(0) ^ (unsigned)getpid());
+        seeded = 1;
+    }
+    for(int i = 0; i < n; i++)
+        buf[i] = alphabet[rand() % (sizeof(alphabet) - 1)];
+}
+
+// DOS int 21, ah=4B, al=3: load overlay into caller-provided memory.
+static void dos_pexec(const char *fname, int pb)
+{
+    debug(debug_dos, "\tload overlay '%s'\n", fname);
+    uint16_t load_seg = get16(pb);
+    uint16_t reloc_seg = get16(pb + 2);
+    FILE *f = fopen(fname, "rb");
+    int err = !f || dos_read_overlay(f, load_seg, reloc_seg);
+    if(f)
+        fclose(f); // the overlay is fully read into memory, nothing keeps the handle
+    if(err)
+    {
+        debug(debug_dos, "\tERROR\n");
+        dos_error = 11;
+        cpuSetAX(dos_error);
+        cpuSetFlag(cpuFlag_CF);
+    }
+    else
+    {
+        dos_error = 0;
+        cpuClrFlag(cpuFlag_CF);
+    }
+}
+
+// DOS int 21, ah=4B, al=1: load a program into memory without executing it,
+// returning its initial SS:SP/CS:IP in the parameter block (used by
+// debuggers such as DEBUG.COM, which then single-steps/breakpoints it).
+static void dos_pload(const char *fname, int pb)
+{
+    debug(debug_dos, "\tload (no exec): '%s'\n", fname);
+    char *prgname = getstr(cpuGetAddrDS(cpuGetDX()), 64);
+    int cmd_addr = cpuGetAddress(get16(pb + 4), get16(pb + 2));
+    int clen = memory[cmd_addr];
+    char *cmdline = getstr(cmd_addr + 1, clen);
+    debug(debug_dos, "\tload command line: '%s %.*s'\n", prgname, clen, cmdline);
+
+    // Resolve the environment block, tracking its byte length (including the
+    // sentinel double-NUL) since create_PSP() needs an explicit size.
+    char *env = "\0\0";
+    uint16_t env_size = 2;
+    uint16_t env_seg = get16(pb);
+    if(!env_seg)
+        env_seg = get16(cpuGetAddress(get_current_PSP(), 0x2C));
+    if(env_seg != 0)
+    {
+        int start_addr = cpuGetAddress(env_seg, 0);
+        int eaddr = start_addr;
+        while(memory[eaddr] != 0 && eaddr < 0xFFFFF)
+        {
+            while(memory[eaddr] != 0 && eaddr < 0xFFFFF)
+                eaddr++;
+            eaddr++;
+        }
+        if(eaddr < 0xFFFFF)
+        {
+            env = (char *)(memory + start_addr);
+            env_size = eaddr - start_addr + 1;
+        }
+    }
+
+    // Save before create_PSP(), which switches current_PSP as a side effect.
+    unsigned old_psp = get_current_PSP();
+    uint16_t psp_mcb = create_PSP(cmdline, env, env_size, prgname);
+    if(!psp_mcb)
+    {
+        debug(debug_dos, "\tnot enough memory for new PSP\n");
+        dos_error = 8;
+        cpuSetAX(dos_error);
+        cpuSetFlag(cpuFlag_CF);
+        return;
+    }
+
+    // Patch the parent link so INT 21/4C can later return control to us.
+    uint8_t *new_psp = memory + (psp_mcb + 1) * 16;
+    new_psp[22] = old_psp & 0xFF;
+    new_psp[23] = old_psp >> 8;
+
+    FILE *f = fopen(fname, "rb");
+    uint16_t ss = 0, sp = 0, cs = 0, ip = 0;
+    int ok = f && dos_load_exe(f, psp_mcb, 0, &ss, &sp, &cs, &ip);
+    if(f)
+        fclose(f);
+
+    if(!ok)
+    {
+        debug(debug_dos, "\tERROR loading '%s'\n", fname);
+        uint16_t env_seg_alloc = get16((psp_mcb + 1) * 16 + 0x2C);
+        mem_free_segment(psp_mcb + 1);
+        mem_free_segment(env_seg_alloc);
+        set_current_PSP(old_psp);
+        dos_error = 11;
+        cpuSetAX(dos_error);
+        cpuSetFlag(cpuFlag_CF);
+        return;
+    }
+
+    // DOS pushes the AX the program would have been started with (the FCB
+    // drive-validity flags) onto the child's stack and returns SP pointing at
+    // it; DEBUG.COM pops it back off into the child's AX.  Without this the
+    // caller starts the child two bytes above its real stack top.
+    sp -= 2;
+    put16(cpuGetAddress(ss, sp), 0);
+
+    put16(pb + 0x0E, sp);
+    put16(pb + 0x10, ss);
+    put16(pb + 0x12, ip);
+    put16(pb + 0x14, cs);
+    debug(debug_dos, "\tloaded PSP=%04x CS:IP=%04x:%04x SS:SP=%04x:%04x\n",
+          psp_mcb + 1, cs, ip, ss, sp);
+    dos_error = 0;
+    cpuClrFlag(cpuFlag_CF);
+}
+
+// DOS takes the terminate / ctrl-break / critical-error addresses stored in a
+// freshly built PSP from the *current* interrupt vectors, not from the parent
+// PSP being copied.  Some Debuggers (MSDebug 4.0 in particular) hook INT 22h before creating
+// the debuggee's PSP and rely on this to regain control when it terminates.
+static void psp_save_vectors(uint16_t psp_seg)
+{
+    int psp = cpuGetAddress(psp_seg, 0);
+    for(int i = 0; i < 3; i++)
+    {
+        put16(psp + 0x0A + 4 * i, get16(4 * (0x22 + i)));
+        put16(psp + 0x0C + 4 * i, get16(4 * (0x22 + i) + 2));
+    }
+}
+
 // DOS int 21
 void intr21(void)
 {
@@ -1507,36 +1709,74 @@ void intr21(void)
         dos_open_file_fcb(0);
         break;
     case 0x10: // CLOSE FILE USING FCB
+    {
         dos_show_fcb();
+        int fcb = get_fcb();
+        unsigned h = get16(0x18 + fcb);
+        int err;
+        if(handles[h])
+            err = dos_close_file(h) != 0;
+        else
+        {
+            // Neither DOS nor CP/M keeps the open state inside the FCB: an FCB
+            // whose handle is already closed is re-resolved by name, so closing
+            // twice succeeds as long as the file still exists.  SID-86 relies on
+            // this when it loads a program (it closes, then closes again to test
+            // the result, printing "Cannot close" if the second one fails).
+            err = dos_fcb_size_by_name(fcb) < 0;
+            debug(debug_dos, "\tfcb already closed, %s.\n",
+                  err ? "file not found" : "OK");
+            if(err)
+            {
+                dos_error = 2;
+                cpuSetFlag(cpuFlag_CF);
+            }
+            else
+            {
+                dos_error = 0;
+                cpuClrFlag(cpuFlag_CF);
+            }
+        }
         // Set full AX because dos_close_file clobbers AX
-        cpuSetAX(dos_close_file(get_fcb_handle()) ? 0x10FF : 0x1000);
+        cpuSetAX(err ? 0x10FF : 0x1000);
         break;
+    }
     case 0x11: // FIND FIRST FILE USING FCB
         dos_find_first_fcb();
         break;
     case 0x12: // FIND NEXT FILE USING FCB
         dos_find_next_fcb();
         break;
-    case 0x13: // DELETE FILE USING FCB
+    case 0x13: // DELETE FILE USING FCB (wildcards supported)
     {
         dos_show_fcb();
-        /* TODO: Limited support. No wild cards */
         int fcb_addr = get_fcb();
-        char *fname = dos_unix_path_fcb(fcb_addr, 0, append_path());
-        if(!fname)
+        struct dos_file_list *list = dos_find_first_file_fcb(fcb_addr, 0); // label=0: no disk-label entry
+        if(!list || !list->unixname)
         {
             debug(debug_dos, "\t(file not found)\n");
+            if(list)
+                dos_free_file_list(list);
             dos_error = 2;
             cpuSetAL(0xFF);
             break;
         }
-        debug(debug_dos, "\tdelete fcb '%s'\n", fname);
-        int e = unlink(fname);
-        free(fname);
-        if(e)
+        int deleted = 0;
+        for(struct dos_file_list *e = list; e && e->unixname; e++)
         {
-            debug(debug_dos, "\tcould not delete file (%d).\n", errno);
-            dos_error = 5;
+            struct stat st;
+            if(stat(e->unixname, &st) == 0 && S_ISDIR(st.st_mode))
+                continue; // skip directories — CP/M fn 19 only deletes files
+            debug(debug_dos, "\tdelete fcb '%s'\n", e->unixname);
+            if(unlink(e->unixname) == 0)
+                deleted++;
+            else
+                debug(debug_dos, "\tcould not delete '%s' (%d).\n", e->unixname, errno);
+        }
+        dos_free_file_list(list);
+        if(!deleted)
+        {
+            dos_error = 2;
             cpuSetAL(0xFF);
         }
         else
@@ -1676,8 +1916,9 @@ void intr21(void)
             debug(debug_dos, "\tinvalid new PSP segment %04x.\n", cpuGetDX());
             break;
         }
-        // Copy PSP to the new segment, 0x80 is what DOS does - this excludes command line
-        memcpy(new_psp, orig_psp, 0x80);
+        // Copy entire PSP (256 bytes) to new segment, including command tail at 0x80..0xFF
+        memcpy(new_psp, orig_psp, 0x100);
+        psp_save_vectors(cpuGetDX());
         break;
     }
     case 0x27: // BLOCK READ FROM FCB
@@ -1849,6 +2090,9 @@ void intr21(void)
         cpuSetAX(dosver);
         cpuSetBX(0x0000);
         break;
+    case 0x31: // TSR Not implemented, finishing with error code (equivalent to going by to the parent with error code)
+        print_error("error, dos tsr invoked, not supported, exiting..\n");
+        break;
     case 0x33: // BREAK SETTINGS
         if(ax == 0x3300)
             cpuSetDX((cpuGetDX() & 0xFF00) | 1);
@@ -1859,13 +2103,22 @@ void intr21(void)
         cpuSetBX(get16(4 * (ax & 0xFF)));
         cpuSetES(get16(4 * (ax & 0xFF) + 2));
         break;
-    case 0x36: // get free space
-        // We only return 512MB free, as some old DOS programs crash if
-        // the free space returned is more than 0x7FFF clusters.
-        cpuSetAX(32);     // 16k clusters
-        cpuSetBX(0x7FFF); // half of disk free, 512MB
-        cpuSetCX(512);    // 512 bytes/sector
-        cpuSetDX(0xFFFF); // total 1GB
+    case 0x36: 
+        // We could at a later stage incorporate a string Disk Mapping but this is 
+        // currently not the case at all across the API. So keeping consistent.
+        if((cpuGetDX() & 0xFF)>26) // check drive number
+        {
+            cpuSetAX(0xFFFF);
+            break;
+        } else {
+            // get free space
+            // we only return 512MB free, as some old DOS programs crash if
+            // the free space returned is more than 0x7FFF clusters.
+            cpuSetAX(32);     // 16k clusters
+            cpuSetBX(0x7FFF); // half of disk free, 512MB
+            cpuSetCX(512);    // 512 bytes/sector
+            cpuSetDX(0xFFFF); // total 1GB
+        }
         break;
     case 0x37: // get/set switch character
         cpuSetDX('/');
@@ -2137,6 +2390,12 @@ void intr21(void)
             break;
         case 0x0E: // GET LOGICAL DRIVE MAP
             cpuSetAX(0x4400);
+            break;
+        default:
+            cpuSetFlag(cpuFlag_CF);
+            dos_error = 1;
+            cpuSetAX(dos_error);
+            break;
         }
         break;
     }
@@ -2255,33 +2514,15 @@ void intr21(void)
         }
         // Flags:   0 = Load and Go, 1 = LOAD, 3 = Overlay
         //        128 = LoadHi
+        int pb = cpuGetAddrES(cpuGetBX());
         if((ax & 0xFF) == 3)
-        {
-            debug(debug_dos, "\tload overlay '%s'\n", fname);
-            int pb = cpuGetAddrES(cpuGetBX());
-            uint16_t load_seg = get16(pb);
-            uint16_t reloc_seg = get16(pb + 2);
-            FILE *f = fopen(fname, "rb");
-            if(!f || dos_read_overlay(f, load_seg, reloc_seg))
-            {
-                debug(debug_dos, "\tERROR\n");
-                dos_error = 11;
-                cpuSetAX(dos_error);
-                cpuSetFlag(cpuFlag_CF);
-            }
-            else
-            {
-                dos_error = 0;
-                cpuClrFlag(cpuFlag_CF);
-            }
-        }
+            dos_pexec(fname, pb);
         else if((ax & 0xFF) == 0)
         {
             debug(debug_dos, "\texec: '%s'\n", fname);
             // Get executable file name:
             char *prgname = getstr(cpuGetAddrDS(cpuGetDX()), 64);
             // Read command line parameters:
-            int pb = cpuGetAddrES(cpuGetBX());
             int cmd_addr = cpuGetAddress(get16(pb + 4), get16(pb + 2));
             int clen = memory[cmd_addr];
             char *cmdline = getstr(cmd_addr + 1, clen);
@@ -2315,6 +2556,8 @@ void intr21(void)
                 cpuClrFlag(cpuFlag_CF);
             }
         }
+        else if((ax & 0xFF) == 1)
+            dos_pload(fname, pb);
         else
         {
             debug(debug_dos, "\texec '%s': type %02xh not supported.\n", fname,
@@ -2335,8 +2578,7 @@ void intr21(void)
         else
         {
             // Exit to parent
-            // TODO: we must close all child file descriptors and deallocate
-            //       child memory.
+            // TODO: we must close all child file descriptors.
             return_code = cpuGetAX() & 0xFF;
             // Patch INT 22h, 23h and 24h addresses to the ones saved in new PSP
             put16(0x88, get16(cpuGetAddress(get_current_PSP(), 10)));
@@ -2346,7 +2588,9 @@ void intr21(void)
             put16(0x90, get16(cpuGetAddress(get_current_PSP(), 18)));
             put16(0x92, get16(cpuGetAddress(get_current_PSP(), 20)));
             // Set PSP to parent
-            set_current_PSP(get16(cpuGetAddress(get_current_PSP(), 22)));
+            uint16_t child_psp = get_current_PSP();
+            set_current_PSP(get16(cpuGetAddress(child_psp, 22)));
+            mem_free_owner(child_psp);
             // Get last stack
             cpuSetSS(get16(cpuGetAddress(get_current_PSP(), 0x30)));
             cpuSetSP(get16(cpuGetAddress(get_current_PSP(), 0x2E)));
@@ -2388,8 +2632,9 @@ void intr21(void)
             debug(debug_dos, "\tinvalid new PSP segment %04x.\n", cpuGetDX());
             break;
         }
-        // Copy PSP to the new segment, 0x80 is what DOS does - this excludes command line
-        memcpy(new_psp, orig_psp, 0x80);
+        // Copy entire PSP (256 bytes) to new segment, including command tail at 0x80..0xFF
+        memcpy(new_psp, orig_psp, 0x100);
+        psp_save_vectors(cpuGetDX());
         // Set parent PSP to the current one
         new_psp[22] = get_current_PSP() & 0xFF;
         new_psp[23] = get_current_PSP() >> 8;
@@ -2460,6 +2705,120 @@ void intr21(void)
     case 0x59: // GET EXTENDED ERROR
         cpuSetAX(dos_error);
         break;
+    case 0x5A: /* CREATE TEMPORARY FILE */
+    {
+        int addr = cpuGetAddrDS(cpuGetDX());
+        unsigned base_len = strlen(getstr(addr, 63));
+
+        int drive = dos_get_default_drive();
+        if(memory[addr + 1] == ':')
+        {
+            uint8_t c = memory[addr];
+            drive = (c >= 'a') ? c - 'a' : c - 'A';
+        }
+
+        int h = get_new_handle();
+        if(h < 0)
+        {
+            dos_error = 4; // Too many open files
+            cpuSetAX(dos_error);
+            cpuSetFlag(cpuFlag_CF);
+            break;
+        }
+
+        char *dir = dos_unix_path(addr, 1, append_path());
+        if(!dir)
+        {
+            dos_error = 3; // Path not found
+            cpuSetAX(dos_error);
+            cpuSetFlag(cpuFlag_CF);
+            break;
+        }
+
+        debug(debug_dos, "\tcreate tmpfile at '%s' ", dir);
+
+        size_t dlen = strlen(dir);
+        while(dlen && dir[dlen - 1] == '/')
+            dlen--;
+
+        char *fname = malloc(dlen + sizeof("/tmpXXXXX.XXX"));
+        if(!fname)
+        {
+            free(dir);
+            dos_error = 5; // Access denied / Out of memory
+            cpuSetAX(dos_error);
+            cpuSetFlag(cpuFlag_CF);
+            break;
+        }
+
+        int fd = -1;
+        // Retry with a fresh random name on collision.
+        for(int tries = 0; tries < 100; tries++)
+        {
+            char suf[8];
+            tmp_name_suffix(suf, 8);
+            sprintf(fname, "%.*s/tmp%c%c%c%c%c.%c%c%c", (int)dlen, dir,
+                    suf[0], suf[1], suf[2], suf[3], suf[4],
+                    suf[5], suf[6], suf[7]);
+            fd = open(fname, O_CREAT | O_EXCL | O_RDWR, 0600);
+            if(fd >= 0 || errno != EEXIST)
+                break;
+        }
+        free(dir);
+
+        if(fd < 0)
+        {
+            debug(debug_dos, "%s.\n", strerror(errno));
+            dos_error = (errno == ENOENT) ? 3 : 5;
+            cpuSetAX(dos_error);
+            cpuSetFlag(cpuFlag_CF);
+            free(fname);
+            break;
+        }
+
+        const char *picked = strrchr(fname, '/');
+        picked = picked ? picked + 1 : fname;
+
+        putmem(addr + base_len,
+            (const uint8_t *)picked,
+            strlen(picked) + 1);
+
+        /* DOS read-only attribute. */
+        if(cpuGetCX() & 1)
+        {
+            if(fchmod(fd, 0400) < 0)
+            {
+                int saved_errno = errno;
+                debug(debug_dos, "warning: fchmod('%s',0400): %s\n", fname, strerror(saved_errno));
+            }
+        }
+
+        FILE *fp = fdopen(fd, "w+b");
+        if(!fp)
+        {
+            int saved_errno = errno;
+
+            close(fd);
+            unlink(fname);
+            debug(debug_dos, "fdopen('%s'): %s.\n", fname, strerror(saved_errno));
+            dos_error = 5;
+            cpuSetAX(dos_error);
+            cpuSetFlag(cpuFlag_CF);
+
+            free(fname);
+            break;
+        }
+
+        handles[h] = fp;
+        devinfo[h] = drive;
+
+        debug(debug_dos, "'%s' OK.\n", fname);
+        free(fname);
+        dos_error = 0;
+        cpuClrFlag(cpuFlag_CF);
+        cpuSetAX(h);
+        break;
+    }
     case 0x5B: // CREATE NEW FILE
         dos_open_file(2, cpuGetAX() & 0xFF, cpuGetAddrDS(cpuGetDX()));
         break;
@@ -2618,6 +2977,34 @@ static char *addstr(char *dst, const char *src, int limit)
 static void init_append(void)
 {
     char *env = getenv(ENV_APPEND);
+    char *cpm_env = getenv(ENV_CPM_APPEND);
+
+    if(cpm_env)
+    {
+        const char *s = cpm_env;
+        char *d = cpm_append_buf;
+
+        while(*s && (d - cpm_append_buf) < 250)
+        {
+            if((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z'))
+            {
+                if(s[1] == ';' || s[1] == 0)
+                {
+                    *d++ = *s++;
+                    *d++ = ':';
+                    if(*s == ';')
+                        *d++ = *s++;
+                    continue;
+                }
+            }
+
+            *d++ = *s++;
+        }
+
+        *d = 0;
+        cpm_append_env = cpm_append_buf;
+    }
+
     // allocate append path and status
     dos_append = get_static_memory(0x100 + 2, 0);
     if(env)
@@ -2801,7 +3188,7 @@ void init_dos(int argc, char **argv)
     // We limit here memory to less than 512K to fix some old programs
     // that check memori using "JLE" instead of "JBE".
     //
-    // CP/M-86: cap the MCB pool to the TPA size when -m / CPM86_TPA_KB is set,
+    // CP/M-86: cap the MCB pool to the TPA size when -m / EMU2_CPM_TPA is set,
     // so loader and runtime M_ALLOC draw from the same ceiling.
     {
         int cpm86_will_run = 0;
@@ -2812,7 +3199,7 @@ void init_dos(int argc, char **argv)
             fclose(pf);
         }
         int tpa_explicit = cpm86_will_run &&
-                           (cpm86_tpa_kb_cli || getenv("CPM86_TPA_KB"));
+                           (cpm86_tpa_kb_cli || getenv("EMU2_CPM_TPA"));
         if(tpa_explicit)
         {
             unsigned tpa_kb = cpm86_get_tpa_kb();
@@ -2929,7 +3316,7 @@ void init_dos(int argc, char **argv)
         if(!cpm86_load_cmd(f, args))
             print_error("error loading CP/M-86 CMD file.\n");
     }
-    else if(!dos_load_exe(f, psp_mcb))
+    else if(!dos_load_exe(f, psp_mcb, 1, NULL, NULL, NULL, NULL))
         print_error("error loading EXE/COM file.\n");
     fclose(f);
 

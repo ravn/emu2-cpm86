@@ -3,12 +3,15 @@
 #include "dbg.h"
 #include "emu.h"
 #include "os.h"
+#include "env.h"
+#include "video.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
@@ -18,6 +21,7 @@
 
 static int term_raw = 0;
 static int tty_fd = -1;
+static int keyboard_suspended = 0; // set by suspend_keyboard, cleared by set_raw_term(1)
 
 // Read one byte from the tty, waiting at most `ms` for it.  Returns 1 and sets
 // *c on success, 0 on timeout / EOF.  Used for escape-sequence lookahead so a
@@ -34,6 +38,15 @@ static int queued_key = -1;
 static int waiting_key = 0;
 static int mod_state = 0;
 static int throttle_calls = 0;
+
+// Keyboard scripting
+static const char *script_data = NULL;
+static int script_len = 0;
+static int script_index = 0;
+static struct timespec last_inject_time = {0, 0};
+static int script_delay_ms = 1;
+static int script_initial_delay_ms = 1;
+static int script_newline_delay_ms = 1;
 
 // Copy mod-state to BIOS memory area
 static void update_bios_state(void)
@@ -69,7 +82,7 @@ static uint8_t special_codes[23][4] = {
     {0x4D, 0x4D, 0x74, 0x9D}, // Right
     {0x49, 0x49, 0x84, 0x99}, // Pg-Up
     {0x51, 0x51, 0x76, 0xA1}, // Pg-Down
-    {0x57, 0x57, 0x77, 0x97}, // Home
+    {0x47, 0x47, 0x77, 0x97}, // Home
     {0x4F, 0x4F, 0x75, 0x9F}, // End
     {0x52, 0x52, 0x92, 0xA2}, // Ins
     {0x53, 0x53, 0x93, 0xA3}, // Del
@@ -101,6 +114,167 @@ enum mod_keys
     MOD_CTRL = 4,
     MOD_ALT = 8
 };
+
+// set initial keyboard script key
+void keyb_set_script_initial_delay(int ms)
+{
+    if(ms < 0) ms = 0;
+    if(ms > 1000000) ms = 1000000;
+    script_initial_delay_ms = ms;
+}
+
+// set per-key keyboard script delay
+void keyb_set_script_delay(int ms)
+{
+    if(ms < 0) ms = 0;
+    if(ms > 1000000) ms = 1000000;
+    script_delay_ms = ms;
+}
+
+// set newline keyboard script delay
+void keyb_set_script_newline_delay(int ms)
+{
+    if(ms < 0) ms = 0;
+    if(ms > 1000000) ms = 1000000;
+    script_newline_delay_ms = ms;
+}
+
+// Normalize DOS/UNIX line edings in a keyboard script file
+static char *normalize_script(const char *raw_data, int raw_len, int *out_len)
+{
+    char *normalized = malloc(raw_len);
+    if(!normalized)
+        return NULL;
+
+    int out_idx = 0;
+    for(int i = 0; i < raw_len; i++)
+    {
+        if(raw_data[i] == 0xD) // CR
+        {
+            // skip CR if followed by LF otherwise keep
+            if(i + 1 < raw_len && raw_data[i + 1] == 0xA)
+            {
+                normalized[out_idx++] = 0xD; // keep CR from CRLF pair
+                i++;
+            }
+            else
+            {
+                normalized[out_idx++] = 0xD; // keep plain CR
+            }
+        }
+        else if(raw_data[i] == 0xA) // LF alone?
+        {
+            normalized[out_idx++] = 0xD; // convert LF to CR
+        }
+        else
+        {
+            normalized[out_idx++] = raw_data[i];
+        }
+    }
+
+    *out_len = out_idx;
+    return normalized;
+}
+
+// load a keyboard script file
+void keyb_load_script(const char *filename, int delay_ms)
+{
+    FILE *f = fopen(filename, "rb");
+    if(!f)
+    {
+        print_error("can't open script '%s': %s\n", filename, strerror(errno));
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(off, E_STATEMENT_NOT_REACHED)
+#endif
+	/*NOTREACHED*/ /* unreachable */ /*LINTED E_STMT_NOT_REACHED*/
+        return;
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(on, E_STATEMENT_NOT_REACHED)
+#endif
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if(size <= 0 || size > 1000000)
+    {
+        print_error("script file '%s' is invalid\n", filename);
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(off, E_STATEMENT_NOT_REACHED)
+#endif
+	/*NOTREACHED*/ /* unreachable */ /*LINTED E_STMT_NOT_REACHED*/
+        fclose(f);
+        return;
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(on, E_STATEMENT_NOT_REACHED)
+#endif
+    }
+
+    char *raw = malloc(size);
+    if(!raw)
+    {
+        print_error("can't allocate memory for script\n");
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(off, E_STATEMENT_NOT_REACHED)
+#endif
+	/*NOTREACHED*/ /* unreachable */ /*LINTED E_STMT_NOT_REACHED*/
+        fclose(f);
+        return;
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(on, E_STATEMENT_NOT_REACHED)
+#endif
+    }
+
+    if(fread(raw, 1, size, f) != size)
+    {
+        print_error("script read error\n");
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(off, E_STATEMENT_NOT_REACHED)
+#endif
+	/*NOTREACHED*/ /* unreachable */ /*LINTED E_STMT_NOT_REACHED*/
+        free(raw);
+        fclose(f);
+        return;
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(on, E_STATEMENT_NOT_REACHED)
+#endif
+    }
+    fclose(f);
+
+    // normalize script
+    char *normalized = normalize_script(raw, size, &script_len);
+    free(raw);
+
+    if(!normalized)
+    {
+        print_error("error processing script\n");
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(off, E_STATEMENT_NOT_REACHED)
+#endif
+	/*NOTREACHED*/ /* unreachable */ /*LINTED E_STMT_NOT_REACHED*/
+        return;
+#if defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+# pragma error_messages(on, E_STATEMENT_NOT_REACHED)
+#endif
+    }
+
+    script_data = normalized;
+    script_index = 0;
+
+    if(delay_ms < 0)
+        delay_ms = 0;
+
+    if(delay_ms > 1000000)
+        delay_ms = 1000000;
+
+    script_delay_ms = delay_ms;
+
+    clock_gettime(CLOCK_MONOTONIC, &last_inject_time);
+
+    debug(debug_int, "loaded script '%s': %d bytes (delay %d ms, initial %d ms)\n",
+          filename, script_len, script_delay_ms, script_initial_delay_ms);
+}
 
 static int get_special_code(int key)
 {
@@ -229,6 +403,51 @@ static int add_scancode(int i)
         return i | get_scancode(i);
     else
         return i;
+}
+
+// Inject scripted keys with configured delays
+static void inject_script_char(void)
+{
+    if(!script_data || script_index >= script_len)
+        return;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    long elapsed_ms = (now.tv_sec  - last_inject_time.tv_sec) * 1000 +
+                      (now.tv_nsec - last_inject_time.tv_nsec) / 1000000;
+
+    long needed_ms = (script_index == 0 && script_initial_delay_ms > 0)
+                      ? script_initial_delay_ms : script_delay_ms;
+
+    if(elapsed_ms < needed_ms)
+        return;
+
+    char ch = script_data[script_index++];
+    int code = add_scancode((unsigned char)ch);
+
+    if(queued_key == -1)
+    {
+        queued_key = code;
+        update_bios_state();
+        cpuTriggerIRQ(1);
+    }
+
+    last_inject_time = now;
+
+    if((ch == '\r' || ch == '\n') && script_newline_delay_ms > 0)
+    {
+        last_inject_time = now;
+        last_inject_time.tv_nsec += (script_newline_delay_ms % 1000) * 1000000;
+
+        if(last_inject_time.tv_nsec >= 1000000000)
+        {
+            last_inject_time.tv_sec++;
+            last_inject_time.tv_nsec -= 1000000000;
+        }
+
+        last_inject_time.tv_sec += script_newline_delay_ms / 1000;
+    }
 }
 
 // Convert key-code with ALT to scan-code
@@ -389,6 +608,8 @@ static void set_raw_term(int raw)
 
     term_raw = raw;
     if(term_raw)
+        keyboard_suspended = 0;
+    if(term_raw)
     {
         struct termios newattr;
         tcgetattr(tty_fd, &oldattr);
@@ -405,6 +626,8 @@ static void set_raw_term(int raw)
         newattr.c_cc[VMIN] = 0;
         newattr.c_cc[VTIME] = 0;
         tcsetattr(tty_fd, TCSANOW, &newattr);
+        if(video_active())
+            video_resync_terminal();
     }
     else
         tcsetattr(tty_fd, TCSANOW, &oldattr);
@@ -422,7 +645,8 @@ static void init_keyboard(void)
     {
         tty_fd = open("/dev/tty", O_NOCTTY | O_RDONLY);
         if(tty_fd < 0)
-            print_error("error at open TTY, %s\n", strerror(errno));
+            print_error("error in %s[%d] at open TTY, %s\n",
+                        __func__, __LINE__, strerror(errno));
         atexit(exit_keyboard);
     }
     set_raw_term(1);
@@ -431,6 +655,7 @@ static void init_keyboard(void)
 // Disables keyboard support - will be enabled again if needed
 void suspend_keyboard(void)
 {
+    keyboard_suspended = 1;
     if(tty_fd >= 0)
         set_raw_term(0);
 }
@@ -454,26 +679,39 @@ int kbhit(void)
         else
         {
             // Used to throttle the CPU on a busy-loop waiting for keyboard
-            static double last_time;
+            static double last_time = 0;
+            static int kbhit_calls_threshold = -1;
+            static int kbhit_time_threshold = -1;
+            static int kbhit_sleep_time = -1;
 
-            struct timeval tv;
-            if(gettimeofday(&tv, NULL) != -1)
+            if (kbhit_calls_threshold == -1)
             {
-                double t1 = tv.tv_usec + tv.tv_sec * 1000000.0;
-                // Arbitrary limit to 4 calls each 100Hz
-                if((t1 - last_time) < 10000)
+                const char *env_calls = getenv(EMU2_KBHIT_CALLS);
+                const char *env_time = getenv(EMU2_KBHIT_TIME);
+                const char *env_sleep = getenv(EMU2_KBHIT_SLEEP);
+                kbhit_calls_threshold = env_calls ? atoi(env_calls) : 1000;
+                kbhit_time_threshold = env_time ? atoi(env_time) : 10000;
+                kbhit_sleep_time = env_sleep ? atoi(env_sleep) : 10000;
+            }
+
+            throttle_calls++;
+            if(kbhit_calls_threshold > 0 && throttle_calls >= kbhit_calls_threshold)
+            {
+                struct timeval tv;
+                if(gettimeofday(&tv, NULL) != -1)
                 {
-                    throttle_calls++;
-                    if(throttle_calls > MAX_KEYB_CALLS)
+                    double t1 = tv.tv_usec + tv.tv_sec * 1000000.0;
+                    // If calls took less than the time threshold, detect as a tight polling loop.
+                    if(last_time != 0 && (t1 - last_time) < kbhit_time_threshold)
                     {
                         debug(debug_int, "keyboard sleep.\n");
-                        cpu_usleep(10000);
-                        throttle_calls = 0;
+                        cpu_usleep(kbhit_sleep_time);
+                        if(gettimeofday(&tv, NULL) != -1)
+                            t1 = tv.tv_usec + tv.tv_sec * 1000000.0;
                     }
+                    last_time = t1;
                 }
-                else
-                    throttle_calls = 0;
-                last_time = t1;
+                throttle_calls = 0;
             }
         }
     }
@@ -503,8 +741,19 @@ int getch(int detect_brk)
 
 void update_keyb(void)
 {
+    // Inject keyboard script keys
+    if(script_data)
+        inject_script_char();
+
     // See if any key is available:
-    if(tty_fd >= 0 && term_raw && !waiting_key && queued_key == -1)
+    // Only poll when not explicitly suspended. suspend_keyboard() sets
+    // keyboard_suspended=1 and puts the terminal into cooked mode for
+    // INT 21h AH=0Ah buffered input; calling kbhit() here would invoke
+    // init_keyboard() which forces raw mode back on before getc(stdin) runs,
+    // causing it to return EOF immediately.
+    // When keyboard has never been initialised (tty_fd<0, term_raw=0) we do
+    // allow kbhit() through so sdb.exe and similar pollers can bootstrap it.
+    if(!keyboard_suspended && !waiting_key && queued_key == -1)
         kbhit();
 }
 
@@ -523,7 +772,8 @@ uint8_t keyb_read_port(unsigned port)
     {
         if(queued_key != -1)
              last_key = queued_key >> 8;
-         queued_key = -1;
+         // Here we don't dequeue because the BIOS relies on the queue.
+         //queued_key = -1;
          return last_key;
     }
     else if(port == 0x61)

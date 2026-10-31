@@ -27,13 +27,13 @@
 #include <stdlib.h>
 #include <strings.h>
 
-// Console interpretation is on by default; EMU2_VT52=0|off|no|false disables it.
+// Console interpretation is on by default; EMU2_CPM_VT52=0|off|no|false disables it.
 static int console_enabled(void)
 {
     static int en = -1;
     if(en < 0)
     {
-        const char *v = getenv("EMU2_VT52");
+        const char *v = getenv("EMU2_CPM_VT52");
         en = !(v && (!strcasecmp(v, "0") || !strcasecmp(v, "off") ||
                      !strcasecmp(v, "no") || !strcasecmp(v, "false")));
     }
@@ -60,7 +60,7 @@ static void op_goto(unsigned x, unsigned y)
         video_set_cursor(x, y);
     else
     {
-        char b[24];
+        char b[32];
         snprintf(b, sizeof b, "\x1b[%u;%uH", y + 1, x + 1);
         emit(b);
     }

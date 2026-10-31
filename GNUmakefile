@@ -26,18 +26,20 @@ OBJS=\
 all: emu2
 
 emu2: $(OBJS:%=obj/%)
-	$(CC) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+	$(CC) -o $@ $^ $(LDLIBS) $(LDFLAGS)
 
 obj/%.o: src/%.c | obj
 	$(CC) $(CFLAGS) -c -o $@ $<
 obj:
 	mkdir -p obj
 
-# Run the CP/M-86 loader relocation regression against the freshly built emu2.
 .PHONY: check test
-check test: emu2 tests/cpm86-reloc/run.sh tests/test_asm86_no_truncate.sh
-	env EMU2="$$(pwd -P)"/emu2 sh tests/cpm86-reloc/run.sh
-	env root="/Users/ravn/z80/cpm86-crossdev" EMU2="$$(pwd -P)"/emu2 sh tests/test_asm86_no_truncate.sh
+check test: emu2 tests/cpm86-reloc/run.sh tests/test_asm86_no_truncate.sh tests/test_cpu_level.sh tests/test_timer_clock.sh
+	env root="$(CURDIR)" EMU2="$$(pwd -P)"/emu2 sh tests/cpm86-reloc/run.sh
+	env root="$(CURDIR)" EMU2="$$(pwd -P)"/emu2 sh tests/test_asm86_no_truncate.sh
+	env root="$(CURDIR)" EMU2="$$(pwd -P)"/emu2 sh tests/test_cpu_level.sh
+	env root="$(CURDIR)" CC="$(CC)" CFLAGS="$(CFLAGS)" LDLIBS="$(LDLIBS)" \
+		sh tests/test_timer_clock.sh
 
 .PHONY: clean distclean
 clean distclean:
@@ -54,21 +56,26 @@ uninstall:
 	rm -f $(DESTDIR)${PREFIX}/bin/emu2
 
 # Generated with gcc -MM src/*.c
-obj/codepage.o: src/codepage.c src/codepage.h src/dbg.h src/os.h src/env.h
-obj/cpu.o: src/cpu.c src/cpu.h src/dbg.h src/os.h src/dis.h src/emu.h
-obj/dbg.o: src/dbg.c src/dbg.h src/os.h src/env.h src/version.h
-obj/dis.o: src/dis.c src/dis.h src/emu.h
-obj/dos.o: src/dos.c src/dos.h src/codepage.h src/cpm86.h src/cpm86_console.h \
- src/dbg.h src/os.h src/dosnames.h src/emu.h src/env.h src/keyb.h src/loader.h \
- src/timer.h src/utils.h src/video.h
-obj/dosnames.o: src/dosnames.c src/dosnames.h src/dbg.h src/os.h src/emu.h \
- src/env.h
-obj/keyb.o: src/keyb.c src/keyb.h src/codepage.h src/dbg.h src/os.h src/emu.h
-obj/loader.o: src/loader.c src/loader.h src/dbg.h src/os.h src/emu.h
-obj/main.o: src/main.c src/dbg.h src/os.h src/dos.h src/dosnames.h src/emu.h \
- src/keyb.h src/timer.h src/video.h
-obj/timer.o: src/timer.c src/timer.h src/dbg.h src/os.h src/emu.h
-obj/utils.o: src/utils.c src/utils.h src/dbg.h src/os.h src/emu.h
-obj/video.o: src/video.c src/video.h src/codepage.h src/dbg.h src/os.h \
+codepage.o: src/codepage.c src/codepage.h src/dbg.h src/os.h src/env.h
+cpm86.o: src/cpm86.c src/cpm86.h src/dbg.h src/os.h src/dos.h src/env.h \
+ src/dosnames.h src/emu.h src/loader.h
+cpm86_console.o: src/cpm86_console.c src/cpm86_console.h src/dos.h \
+ src/os.h src/video.h
+cpu.o: src/cpu.c src/cpu.h src/dbg.h src/os.h src/dis.h src/emu.h \
+ src/env.h src/utils.h
+dbg.o: src/dbg.c src/dbg.h src/os.h src/env.h src/version.h
+dis.o: src/dis.c src/dis.h src/emu.h
+dos.o: src/dos.c src/dos.h src/os.h src/codepage.h src/cpm86.h \
+ src/cpm86_console.h src/dbg.h src/dosnames.h src/emu.h src/env.h \
+ src/keyb.h src/loader.h src/timer.h src/utils.h src/video.h
+dosnames.o: src/dosnames.c src/dosnames.h src/cpm86.h src/dbg.h src/os.h \
+ src/emu.h src/env.h
+keyb.o: src/keyb.c src/keyb.h src/codepage.h src/dbg.h src/os.h src/emu.h \
+ src/env.h src/video.h
+loader.o: src/loader.c src/loader.h src/dbg.h src/os.h src/emu.h
+main.o: src/main.c src/cpm86.h src/dbg.h src/os.h src/dos.h \
+ src/dosnames.h src/emu.h src/env.h src/keyb.h src/timer.h src/video.h
+timer.o: src/timer.c src/timer.h src/dbg.h src/os.h src/emu.h
+utils.o: src/utils.c src/utils.h src/dbg.h src/os.h
+video.o: src/video.c src/video.h src/codepage.h src/dbg.h src/os.h \
  src/emu.h src/env.h src/keyb.h
-obj/cpm86_console.o: src/cpm86_console.c src/cpm86_console.h src/dos.h src/video.h

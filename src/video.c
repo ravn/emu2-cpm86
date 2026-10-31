@@ -52,6 +52,7 @@ static uint16_t crtc_cursor_loc;
 
 // Forward
 static void term_goto_xy(unsigned x, unsigned y);
+static void init_video(void);
 
 // Signal handler - terminal size changed
 // TODO: not used yet.
@@ -93,6 +94,32 @@ static void term_get_size(void)
         term_sy = 25;
         debug(debug_video, "can't get terminal size, assuming %ux%u\n", term_sx, term_sy);
     }
+}
+
+// Automatically determine the terminal column count.
+static unsigned term_get_cols_auto(void)
+{
+    struct winsize ws;
+    int fd = tty_file ? fileno(tty_file) : STDOUT_FILENO;
+
+    if(ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+
+    // Keep the old usual default for fallback
+    return 80;
+}
+
+// Automatically determine the terminal row count.
+static unsigned term_get_rows_auto(void)
+{
+    struct winsize ws;
+    int fd = tty_file ? fileno(tty_file) : STDOUT_FILENO;
+
+    if(ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+        return ws.ws_row;
+
+    // Keep the old usual default for fallback
+    return 25;
 }
 
 // Update posx/posy in BIOS memory and CRTC for one page only
@@ -158,6 +185,18 @@ static void set_text_mode(int mode, int clear)
     // Clear video screen
     if(clear)
     {
+        if(opt_fullscreen)
+        {
+            if(!video_initialized)
+                init_video();
+            fputs("\x1b[2J\x1b[H", tty_file);
+            fflush(tty_file);
+            output_row = -1;
+            term_posy = 0;
+            for(unsigned y = 0; y < 64; y++)
+                for(unsigned x = 0; x < 256; x++)
+                    term_screen[y][x].value = 0xFFFF;
+        }
         uint16_t *vm = (uint16_t *)(memory + 0xB8000);
         for(int i = 0; i < 16384; i++)
             vm[i] = get_cell(0x20, 0x07).value;
@@ -230,10 +269,12 @@ static void init_video(void)
     debug(debug_video, "starting video emulation.\n");
     int tty_fd = open("/dev/tty", O_NOCTTY | O_WRONLY);
     if(tty_fd < 0)
-        print_error("error at open TTY, %s\n", strerror(errno));
+        print_error("error in %s[%d] at open TTY, %s\n",
+                    __func__, __LINE__, strerror(errno));
     tty_file = fdopen(tty_fd, "w");
     if(!tty_file)
-        print_error("error at open TTY, %s\n", strerror(errno));
+        print_error("error in %s[%d] at open TTY, %s\n",
+                    __func__, __LINE__, strerror(errno));
     fputs("\x1b[?7l", tty_file); // Disable automatic margin
     atexit(exit_video);
     video_initialized = 1;
@@ -294,6 +335,49 @@ static void vid_set_font(unsigned lines)
     update_posxy();
 }
 
+static void vid_set_cols(unsigned cols)
+{
+    if(cols > 132)
+        cols = 132;
+    else if(cols < 40)
+        cols = 40;
+
+    debug(debug_video, "set %u cols mode\n", cols);
+    vid_sx = cols;
+    memory[0x44A] = vid_sx;
+    update_posxy();
+}
+
+static void vid_set_rows(unsigned rows)
+{
+    if(rows > 64)
+        rows = 64;
+    else if(rows < 12)
+        rows = 12;
+
+    unsigned max = get_last_used_row();
+    debug(debug_video, "set %u rows mode from %u\n", rows, max);
+
+    if(video_active() && max > rows)
+    {
+        term_goto_xy(0, rows - 1);
+        set_color(0x07);
+        fputs("\x1b[J", tty_file);
+        for(int y = rows; y < 64; y++)
+            for(int x = 0; x < 256; x++)
+                term_screen[y][x] = get_cell(0x20, 0x07);
+        if(output_row > (int)rows - 1)
+            output_row = rows - 1;
+    }
+    vid_sy = rows;
+    vid_font_lines = vid_scan_lines / rows;
+    if(vid_font_lines < 8) vid_font_lines = 8;
+    memory[0x484] = vid_sy - 1;
+    memory[0x485] = vid_font_lines;
+    memory[0x486] = 0;
+    update_posxy();
+}
+
 void video_init_mem(void)
 {
     // Fill the functionality table
@@ -311,19 +395,56 @@ void video_init_mem(void)
     // Set video mode 3 and clear screen
     set_text_mode(3, 1);
     // Setup non-standard mode:
-    if(getenv(ENV_ROWS))
+    const char *cols_env = getenv(ENV_COLS);
+    if(cols_env)
     {
-        unsigned rows = atoi(getenv(ENV_ROWS));
-        if(rows > 12 && rows <= 50)
-            vid_set_font(400 / rows);
-        else if(rows == 12)
-            vid_set_font(32);
+        if(!strcmp(cols_env, "auto"))
+        {
+            unsigned cols = term_get_cols_auto();
+            if(cols < 40)
+                cols = 40;
+            else if(cols > 132)
+                cols = 132;
+            debug(debug_video, "auto cols: using %u terminal columns\n", cols);
+            vid_set_cols(cols);
+        }
+        else
+        {
+            unsigned cols = atoi(cols_env);
+            if(cols >= 40 && cols <= 132)
+                vid_set_cols(cols);
+        }
+    }
+    const char *rows_env = getenv(ENV_ROWS);
+    if(rows_env)
+    {
+        if(!strcmp(rows_env, "auto"))
+        {
+            unsigned rows = term_get_rows_auto();
+            if(rows < 12)
+                rows = 12;
+            else if(rows > 50)
+                rows = 50;
+            debug(debug_video, "auto rows: using %u terminal rows\n", rows);
+            vid_set_rows(rows);
+        }
+        else
+        {
+            unsigned rows = atoi(rows_env);
+            if(rows >= 12 && rows <= 64)
+                vid_set_rows(rows);
+        }
     }
 }
 
 // Writes a DOS character to the current terminal position
 static void put_vc(uint8_t c)
 {
+    if(codepage_disabled())
+    {
+        putc(c, tty_file);
+        return;
+    }
     uint16_t uc = get_unicode(c);
     if(uc < 128)
         putc(uc, tty_file);
@@ -348,7 +469,13 @@ static void term_goto_xy(unsigned x, unsigned y)
 
     if(term_posy < y && (int)term_posy < output_row)
     {
-        int inc = (int)y < output_row ? y - term_posy : output_row - term_posy;
+        // Do the subtraction entirely in the signed domain: output_row can
+        // legitimately be negative here, and mixing it with the unsigned
+        // term_posy makes C silently promote output_row to a huge unsigned
+        // value before subtracting, corrupting `inc` (and, two lines down,
+        // term_posy itself).
+        int inc = (int)y < output_row ? (int)y - (int)term_posy
+                                       : output_row - (int)term_posy;
         fprintf(tty_file, "\x1b[%dB", inc);
         term_posy += inc;
     }
@@ -387,8 +514,8 @@ static void put_vc_xy(uint8_t vc, uint8_t color, unsigned x, unsigned y)
 
     put_vc(vc);
     term_posx++;
-    if(term_posx > term_sx)
-        term_posx = term_sx;
+    if(term_posx >= term_sx)
+        term_posx = term_sx - 1;
 
     if(output_row < (int)term_posy)
         output_row = term_posy;
@@ -487,15 +614,28 @@ static void vid_scroll_up(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1, int n,
         n = y1 + 1 - y0;
 
     // Scroll TERMINAL if we are scrolling (almost) the entire screen
-    if(y0 == 0 && y1 >= vid_sy - 2 && x0 < 2 && x1 >= vid_sx - 2)
+    if(!opt_fullscreen && y0 == 0 && y1 >= vid_sy - 2 && x0 < 2 && x1 >= vid_sx - 2)
     {
         // Update screen before
         check_screen();
-        unsigned m = n > output_row + 1 ? output_row + 1 : n;
+        // output_row can already be negative from a previous scroll; clamp
+        // the available rows to >= 0 before it's used to compute an
+        // unsigned line count, otherwise a negative value wraps to a huge
+        // unsigned number and corrupts term_posy (and the cursor-movement
+        // escape codes generated from it) on the next call.
+        int avail = output_row + 1;
+        if(avail < 0)
+            avail = 0;
+        unsigned m = (unsigned)(n > avail ? avail : n);
         if(term_posy < m)
             term_goto_xy(0, m);
         output_row -= m;
-        term_posy -= m;
+        // term_goto_xy() clamps its target row to term_sy-1 (a full-height
+        // scroll can have m == term_sy, one past the last valid row index),
+        // so term_posy can end up one short of m even after the call
+        // above. Clamp instead of subtracting unconditionally, otherwise
+        // this legitimately underflows the unsigned term_posy.
+        term_posy = (term_posy > m) ? term_posy - m : 0;
         for(unsigned y = 0; y + m < term_sy; y++)
             for(unsigned x = 0; x < term_sx; x++)
                 term_screen[y][x].value = term_screen[y + m][x].value;
@@ -716,10 +856,38 @@ void video_set_attr(uint8_t attr)
     vid_color = attr;
 }
 
+// Force terminal to be fully redrawn
+void video_resync_terminal(void)
+{
+    if(!video_initialized)
+        return;
+    // VT100: Reset, Clear, Home
+    fputs("\x1b[0m\x1b[2J\x1b[H",
+          tty_file);
+    fflush(tty_file);
+    output_row = -1;
+    term_posx = 0;
+    term_posy = 0;
+    term_color = 0x07;
+    for(unsigned y = 0; y < 64; y++)
+        for(unsigned x = 0; x < 256; x++)
+            term_screen[y][x].value = 0xFFFF;
+}
+
 void video_clear_screen(void)
 {
     if(!video_initialized)
         init_video();
+    if(opt_fullscreen)
+    {
+        fputs("\x1b[2J\x1b[H", tty_file);
+        fflush(tty_file);
+        output_row = -1;
+        term_posy = 0;
+        for(unsigned y = 0; y < 64; y++)
+            for(unsigned x = 0; x < 256; x++)
+                term_screen[y][x].value = 0xFFFF;
+    }
     int page = vid_page;
     for(unsigned y = 0; y < vid_sy; y++)
         for(unsigned x = 0; x < vid_sx; x++)

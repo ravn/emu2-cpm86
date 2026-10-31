@@ -1,4 +1,3 @@
-
 #define _GNU_SOURCE
 
 #include "dosnames.h"
@@ -30,7 +29,7 @@ static char dos_valid_char(char c)
     return 0;
 }
 
-// Converts the Unix filename "u" to a Dos filename "d".
+// Converts the UNIX filename "u" to a DOS filename "d".
 static int unix_to_dos(uint8_t *d, const char *u)
 {
     int dot;
@@ -86,7 +85,7 @@ static const struct dos_file_list *dos_search_unix_name(const struct dos_file_li
     return 0;
 }
 
-// Sort unix entries so that '~' and '.' comes before other chars
+// Sort UNIX entries so that '~' and '.' comes before other chars
 static int dos_unix_sort(const struct dirent **s1, const struct dirent **s2)
 {
     const char *n1 = (*s1)->d_name;
@@ -102,7 +101,7 @@ static int dos_unix_sort(const struct dirent **s1, const struct dirent **s2)
         if(!*n1 && !*n2)
         {
             // The two DOS-visible names are equal,
-            // sort by Unix name.
+            // sort by UNIX name.
             return strcmp((*s1)->d_name, (*s2)->d_name);
         }
         if(!*n1)
@@ -174,7 +173,7 @@ static int dos_glob(const uint8_t *n, const char *g)
 }
 // DOS files are 8 chars name, 3 chars extension, uppercase only.
 // We read the full directory and convert filenames to dos names,
-// then we can search the correct ones. 'path' is the Unix path,
+// then we can search the correct ones. 'path' is the UNIX path,
 // returning all the files matching with glob.
 static struct dos_file_list *dos_read_dir(const char *path, const char *glob, int label,
                                           int dirs)
@@ -329,7 +328,7 @@ static void str_lcase(char *str)
 }
 
 ////////////////////////////////////////////////////////////////////
-// Converts a DOS filename to Unix filename, at the given path
+// Converts a DOS filename to UNIX filename, at the given path
 static char *dos_unix_name(const char *path, const char *dosN, int force)
 {
     // First, try the name as given:
@@ -611,7 +610,7 @@ static char *search_append_path(char *path, const char *append)
     return 0;
 }
 
-// Converts a DOS full path to equivalent Unix filename
+// Converts a DOS full path to equivalent UNIX filename
 char *dos_unix_path(int addr, int force, const char *append)
 {
     char *path = getstr(addr, 63);
@@ -633,7 +632,7 @@ char *dos_unix_path(int addr, int force, const char *append)
     return search_append_path(path, append);
 }
 
-// Converts a FCB path to equivalent Unix filename
+// Converts a FCB path to equivalent UNIX filename
 char *dos_unix_path_fcb(int addr, int force, const char *append)
 {
     // Copy drive number from the FCB structure:
@@ -643,8 +642,10 @@ char *dos_unix_path_fcb(int addr, int force, const char *append)
     else
     {
         drive = drive - 1;
-        // Don't append if drive is specified.
-        append = 0;
+        // Don't append if drive is specified -- except for CP/M-86 append when
+        // the FCB drive is the default drive, so merged drives are searched.
+        if(!(cpm86_active && drive == dos_default_drive))
+            append = 0;
     }
     // And copy file name
     char *fcb_name = getstr(addr + 1, 11);

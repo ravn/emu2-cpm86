@@ -8,6 +8,7 @@
 #include "emu.h"
 #include "loader.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,20 +63,20 @@ int cpm86_active = 0;
 // TPA size override from "-m <kb>"; 0 = not set (see cpm86_get_tpa_kb).
 unsigned cpm86_tpa_kb_cli = 0;
 
-// Poison byte from "-P <byte>"; -1 = not set (fall back to CPM86_POISON env var).
+// Poison byte from "-P <byte>"; -1 = not set (fall back to EMU2_CPM_POISON env var).
 int cpm86_poison_cli = -1;
 
 // "-D" flag: fill free memory with 0xFF before loading; 0 = not set.
 int cpm86_dirty_cli = 0;
 
-// TPA size in KB: "-m" > CPM86_TPA_KB env var > ~640K default.
+// TPA size in KB: "-m" > EMU2_CPM_TPA env var > ~640K default.
 // Used by both the CMD loader and dos.c MCB init so they agree on one ceiling.
 unsigned cpm86_get_tpa_kb(void)
 {
     static const unsigned default_tpa_kb = 640;
     if(cpm86_tpa_kb_cli)
         return cpm86_tpa_kb_cli;
-    const char *e = getenv("CPM86_TPA_KB");
+    const char *e = getenv("EMU2_CPM_TPA");
     if(e && *e)
     {
         unsigned v = (unsigned)strtoul(e, 0, 0);
@@ -104,7 +105,7 @@ static void cpm_set_dta(void); // defined below; used by the loader
 // actual count.  Search results (BDOS 17/18) also carry the LRBC at ENTRY+13
 // (S1) of each fabricated directory entry.  Older programs that check for 2.2
 // leave FCB+32 alone, so the metadata is only exposed when we report 3.0+.
-// Default is CP/M 3.1; override with EMU2_CPMVER (e.g. "2.2", "3.1").
+// Default is CP/M 3.1; override with EMU2_CPM_VER (e.g. "2.2", "3.1").
 static uint16_t cpm_version = 0x0031; // packed BDOS version, 0x31 = CP/M 3.1
 static int cpm_lrbc = 1;              // expose LRBC byte-count metadata (CP/M 3+)
 static int cpm_lrbc_trunc = 1;        // also trim host files to the LRBC length
@@ -136,7 +137,7 @@ static unsigned long cpm_lrbc_exact(unsigned long sz, unsigned lrbc)
     return (recs - 1) * 128 + lrbc;     // lrbc = used bytes in the last record
 }
 
-// Parse EMU2_CPMVER ("3.1", "2.2", "3", ...) into the reported BDOS version and
+// Parse EMU2_CPM_VER ("3.1", "2.2", "3", ...) into the reported BDOS version and
 // decide whether to expose the LRBC byte-count metadata (CP/M 3.0 and later).
 static void cpm_init_version(void)
 {
@@ -153,7 +154,7 @@ static void cpm_init_version(void)
         cpm_version = (uint16_t)(((major & 0x0F) << 4) | (minor & 0x0F));
     }
     cpm_lrbc = (cpm_version & 0xFF) >= 0x30;
-    // EMU2_LRBC_NOTRUNC (any value but 0/off/no/false) keeps the LRBC byte count
+    // EMU2_CPM_NOTRUNC (any value but 0/off/no/false) keeps the LRBC byte count
     // visible but stops emu2 from trimming host files to that exact length, in
     // case a tool relies on output staying padded to the 128-byte record.  Host
     // truncation also implies LRBC, so a pre-3.0 version (which has no LRBC)
@@ -455,7 +456,7 @@ int cpm86_load_cmd(FILE *f, const char *cmdline)
     if(!code)
         return 0;
 
-    // -P <byte> / -D / CPM86_POISON=<byte> / CPM86_DIRTY_GROUPS:
+    // -P <byte> / -D / EMU2_CPM_POISON=<byte> / EMU2_CPM_DIRTY:
     // fill free memory before loading to surface uninitialized-read bugs.
     // CLI flags take precedence over env vars.
     int dirty_groups = 0;
@@ -471,8 +472,8 @@ int cpm86_load_cmd(FILE *f, const char *cmdline)
     }
     else
     {
-        const char *dg = getenv("CPM86_DIRTY_GROUPS");
-        const char *pe = getenv("CPM86_POISON");
+        const char *dg = getenv("EMU2_CPM_DIRTY");
+        const char *pe = getenv("EMU2_CPM_POISON");
         if(dg && *dg && *dg != '0')
             dirty_groups = 1;
         if(pe && *pe)
@@ -487,6 +488,8 @@ int cpm86_load_cmd(FILE *f, const char *cmdline)
     // assumptions).  Should key off the header group layout instead.
     int model_8080 = (data == 0);
     uint16_t code_par = code->max ? code->max : code->length;
+    if(code_par < code->min)    // code group min may reserve space for overlay buffers
+         code_par = code->min;
     if(code_par < code->length)
         code_par = code->length;
 
@@ -774,7 +777,8 @@ int cpm86_load_cmd(FILE *f, const char *cmdline)
     // the command name) so parsers that expect that format work.
     char tail[130];
     unsigned tl = 0;
-    tail[tl++] = ' ';
+    if(cmdline && *cmdline)
+        tail[tl++] = ' '; 
     for(const char *s = cmdline ? cmdline : ""; *s && tl < 0x7F; s++)
     {
         char c = *s;
@@ -807,7 +811,7 @@ int cpm86_load_cmd(FILE *f, const char *cmdline)
     // Separate-group (small/compact) models enter at code:0.
     cpuSetIP(model_8080 ? 0x100 : 0);
     cpuSetDS(cpm_base_seg);
-    cpuSetES(cpm_base_seg);
+    cpuSetES(extra_seg ? extra_seg : cpm_base_seg);
     // SS: NOT cpm_base_seg. stack_seg is now always set (either the CMD's own
     // declared STACK group, or the spec-default scratch stack allocated
     // above), so the program starts on a segment genuinely separate from DS,
@@ -1256,6 +1260,107 @@ static int cpm_chain(void)
     return 1;
 }
 
+// BDOS 59 (P_LOAD, "Load Program"): load the program named by the FCB at DS:DX
+// without transferring control to it, reusing the current PSP.  Used by CCP
+// implementations that want to load a transient and call it themselves (the CCP
+// stays resident and loops back after the callf returns).  The CCP is
+// responsible for writing the command tail and default FCBs into the transient's
+// base page after pload returns (see TRNCMO in ccpnew.a86).  Returns 1 with
+// BX = the transient's base-page segment if loaded, 0 if the program was not
+// found or could not load (caller then does bdos_ret(0xFF)).
+//
+// A key limitation of the CP/M-86 API is that there is no way to deallocate from 
+// within the process the memory allocated to the load by the process
+// in the case of cp/m-86, the memory will be deallocated with a freeall when the 
+// parent process goes away.
+// to be able to have a proper multi process behaviour, the CP/M-86 API would need
+// to include explicit memory management calls for loaded transients, which it does not.
+// right now it behaves as intended by CP/M-86
+static int cpm_pload(void)
+{
+    // Parse prog[] from FCB at DS:DX (name bytes 1-8, ext bytes 9-11).
+    // The CCP has already parsed the command line into the FCB before calling
+    // pload; the FCB is the authoritative filename source.
+    uint32_t fcb = cpuGetAddrDS(cpuGetDX());
+    char prog[64];
+    unsigned pn = 0;
+    for(int i = 0; i < 8; i++)
+    {
+        uint8_t c = memory[(fcb + 1 + i) & 0xFFFFF] & 0x7F;
+        if(c == ' ') break;
+        prog[pn++] = (char)tolower(c);
+    }
+    prog[pn++] = '.';
+    for(int i = 0; i < 3; i++)
+    {
+        uint8_t c = memory[(fcb + 9 + i) & 0xFFFFF] & 0x7F;
+        if(c == ' ') break;
+        prog[pn++] = (char)tolower(c);
+    }
+    prog[pn] = 0;
+    debug(debug_dos, "CP/M BDOS 59 (pload): prog=\"%s\"\n", prog);
+    if(pn == 0)
+        return 0;
+
+    // The CCP writes the command tail into the transient's bp:0x80 after return.
+    const char *tail = "";
+
+    // Open <prog> then <prog>.CMD from the current host drive.
+    FILE *f = fopen(prog, "rb");
+    if(!f)
+    {
+        char withext[70];
+        snprintf(withext, sizeof(withext), "%s.CMD", prog);
+        f = fopen(withext, "rb");
+    }
+    if(!f)
+    {
+        debug(debug_dos, "CP/M pload: program \"%s\" not found\n", prog);
+        return 0;
+    }
+
+    // Save the caller's CPU registers and segment globals before cpm86_load_cmd
+    // overwrites them.  Unlike chain, the caller (CCP) is still running, so:
+    // - do NOT free its memory; zero the globals so cpm86_load_cmd allocates
+    //   fresh segments for the transient without touching the CCP.
+    // - DS/SS/SP must be restored so the iret in intr_cpm_bdos pops the correct
+    //   frame from the CCP's stack.
+    // - cpm_wboot_seg must be restored: cpm86_load_cmd arms it to the transient's
+    //   code seg for 8080-model programs; if left set it fires the warm-boot trap
+    //   the instant the CCP does its callf to transient entry at CS:0.
+    uint16_t sv_ds = cpuGetDS(), sv_ss = cpuGetSS(), sv_sp = cpuGetSP();
+    uint16_t sv_code  = cpm_code_seg,  sv_data  = cpm_data_seg;
+    uint16_t sv_base  = cpm_base_seg,  sv_extra = cpm_extra_seg;
+    uint16_t sv_stack = cpm_stack_seg, sv_wboot = cpm_wboot_seg;
+    cpm_code_seg = cpm_data_seg = cpm_base_seg = cpm_extra_seg = cpm_stack_seg = 0;
+
+    int ok = cpm86_load_cmd(f, tail);
+    fclose(f);
+    if(!ok)
+    {
+        debug(debug_dos, "CP/M pload: failed to load \"%s\"\n", prog);
+        cpm_code_seg  = sv_code;  cpm_data_seg  = sv_data;
+        cpm_base_seg  = sv_base;  cpm_extra_seg = sv_extra;
+        cpm_stack_seg = sv_stack; cpm_wboot_seg = sv_wboot;
+        cpuSetDS(sv_ds); cpuSetSS(sv_ss); cpuSetSP(sv_sp);
+        return 0;
+    }
+
+    // cpm86_load_cmd succeeded: cpm_base_seg now holds the transient's base page.
+    uint16_t new_base = cpm_base_seg;
+
+    // Restore the caller's segment globals and CPU registers.
+    cpm_code_seg  = sv_code;  cpm_data_seg  = sv_data;
+    cpm_base_seg  = sv_base;  cpm_extra_seg = sv_extra;
+    cpm_stack_seg = sv_stack; cpm_wboot_seg = sv_wboot;
+    cpuSetDS(sv_ds); cpuSetSS(sv_ss); cpuSetSP(sv_sp);
+
+    // Return BX = new base-page segment, AL = 0.
+    cpuSetBX(new_base);
+    cpuSetAX(0);
+    return 1;
+}
+
 void intr_cpm_bdos(void)
 {
     unsigned func = cpuGetCX() & 0xFF;
@@ -1308,7 +1413,7 @@ void intr_cpm_bdos(void)
     case 10: bdos_ret(bdos_via_dos(0x0A)); break; // read console buffer
     case 11: bdos_ret(cpm_con_status()); break;   // console status
 
-    case 12: // Return Version Number (0x0022 = 2.2, 0x0031 = 3.1); EMU2_CPMVER
+    case 12: // Return Version Number (0x0022 = 2.2, 0x0031 = 3.1); EMU2_CPM_VER
         bdos_ret(cpm_version);
         break;
 
@@ -1328,28 +1433,21 @@ void intr_cpm_bdos(void)
     // CP/M-86 passes the FCB in DS:DX exactly like the DOS FCB calls (which
     // descend from CP/M), so each maps to the matching DOS INT 21h function.
     case 13: bdos_ret(bdos_via_dos(0x0D)); break; // reset disk system
-    case 14: bdos_ret(bdos_via_dos(0x0E)); break; // select disk
-    case 16: // close file.  CP/M 3 LRBC: if the program stored a partial last-
-    {        // record byte count at FCB+32 (FCB+0x20), trim the host file to
-             // that exact length before closing so its on-disk size is no longer
-             // record-rounded.  Per CP/M 3 / DOS Plus, the LRBC lives at FCB+32,
-             // NOT in S1 (FCB+13); programs must reset FCB+32 to 0 before
-             // sequential I/O (the open handler only fills it, never clears it).
-        if(cpm_lrbc_trunc)
-        {
-            uint32_t fcb = cpuGetAddrDS(dx);
-            unsigned lrbc = memory[fcb + 0x20] & 0x7F; // FCB+32; 0 = full last record
-            unsigned long sz = get32(fcb + 0x10);
-            if(lrbc && sz)
-            {
-                unsigned long exact = cpm_lrbc_exact(sz, lrbc);
-                if(exact < sz)
-                    dos_truncate_fcb(fcb, exact);
-            }
+    case 14: // SELECT DISK
+        if((cpuGetDX() & 0xFF) >= 16) { // Letter P: last supported letter
+            bdos_ret(0xFF); 
+        } else {
+            bdos_via_dos(0x0E);
+            bdos_ret(0x00);
         }
+        break; 
+    case 16: // close file.  Per CP/M 3 / DOS Plus, the LRBC (last-record byte
+             // count) is set AFTER close via BDOS 30 (F_ATTRIB) with bit 7 of
+             // FCB+6 set - handled in case 30 below.  FCB+0x20 at close time is
+             // the CR (current record) field from sequential I/O, NOT an LRBC
+             // value, so we must not interpret it as one.
         bdos_ret(bdos_via_dos(0x10));
         break;
-    }
     case 17: bdos_ret(cpm_search(0x11)); break; // search for first (CP/M dir entry)
     case 18: bdos_ret(cpm_search(0x12)); break; // search for next
     case 19: bdos_ret(bdos_via_dos(0x13)); break; // delete file
@@ -1357,7 +1455,21 @@ void intr_cpm_bdos(void)
     case 21: bdos_ret(bdos_seq(0x15)); break; // write sequential
     case 22: bdos_ret(bdos_via_dos(0x16)); break; // make file
     case 23: bdos_ret(bdos_via_dos(0x17)); break; // rename file
-    case 33: bdos_ret(bdos_read(0x21)); break; // read random
+    case 33: // read random — CP/M-86 updates the sequential file position to the
+    {        // record just read, so subsequent sequential I/O starts from there.
+             // DOS fn=0x21 does not do this; apply the update manually on success.
+        unsigned r = bdos_read(0x21);
+        if(r == 0)
+        {
+            int fcb = cpuGetAddrDS(cpuGetDX());
+            if(memory[fcb] == 255) fcb += 7; // extended FCB: skip 7-byte prefix
+            unsigned rand = get16(0x21 + fcb) | ((unsigned)memory[0x23 + fcb] << 16);
+            memory[0x20 + fcb] = rand & 127;   // CR  = rand mod 128
+            put16(0x0C + fcb, rand / 128);     // EX  = rand / 128
+        }
+        bdos_ret(r);
+    }
+    break;
     case 34: bdos_ret(bdos_via_dos(0x22)); break; // write random
     case 35: bdos_ret(bdos_via_dos(0x23)); break; // compute file size
     case 36: bdos_ret(bdos_via_dos(0x24)); break; // set random record
@@ -1394,7 +1506,7 @@ void intr_cpm_bdos(void)
         // CP/M 3 / DOS Plus exact-size: the documented way to record a file's
         // last-record byte count is to re-issue F_ATTRIB with F6' (bit 7 of FCB
         // byte 6) set and the byte count in FCB+0x20.  When LRBC truncation is
-        // enabled (off under EMU2_LRBC_NOTRUNC or CP/M 2.2), trim the closed
+        // enabled (off under EMU2_CPM_NOTRUNC or CP/M 2.2), trim the closed
         // host file to the exact length that count implies.  dos_truncate_fcb_name
         // refuses any trim larger than one 128-byte record, so a stray F6' or a
         // bogus count cannot discard real data.
@@ -1646,7 +1758,12 @@ void intr_cpm_bdos(void)
             exit(0);
         break;
 
-    default:
+    case 59: // P_LOAD: Load Program (returns base-page segment in BX)
+        if(!cpm_pload())
+            bdos_ret(0xFF);
+        break;
+
+     default:
         debug(debug_dos, "CP/M BDOS %u: UNIMPLEMENTED (DX=%04x)\n", func, dx);
         bdos_ret(0xFF); // 0xFF = error / not found for most file funcs
         break;
